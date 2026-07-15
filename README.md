@@ -7,8 +7,9 @@ first downloading the complete archive. CBR support is available in a strict,
 best-effort mode because solid RAR archives are not inherently random-access.
 
 > [!IMPORTANT]
-> This project still requires validation on its target Kobo hardware. Treat
-> builds as development artifacts, not production releases.
+> This project still requires validation on its target Kobo hardware. Builds
+> are experimental and support Kobo firmware 4.x only; do not install them on
+> firmware 5.x.
 
 ## What this fork adds
 
@@ -27,20 +28,35 @@ best-effort mode because solid RAR archives are not inherently random-access.
 The full design, security properties, limitations, and device-validation
 checklist are in [WebDAV comic streaming](doc/WebDAV_comic_streaming.md).
 
+## Download and install
+
+Tagged builds are published as experimental assets on the repository's
+[Releases](https://github.com/yoshitaka420/koreader-stream/releases) page. Use
+the standard `kobo` ZIP for an initial installation or the `.updated.tar` file
+to update an existing installation. Every download has a SHA-256 checksum.
+
+The main branch is also built on the
+[Actions](https://github.com/yoshitaka420/koreader-stream/actions) page for
+testers. Those temporary artifacts expire; normal users should use a tagged
+release.
+
+Follow [Installing KOReader Stream on Kobo](doc/Kobo_builds.md) for firmware
+requirements, checksum verification, first installation, updates, WebDAV
+configuration, rollback, and removal.
+
 ## Getting started
 
-Clone the project and all submodules:
+Clone the project and prepare its public dependencies:
 
 ```sh
-git clone --recurse-submodules https://github.com/yoshitaka420/koreader-stream.git
+git clone https://github.com/yoshitaka420/koreader-stream.git
 cd koreader-stream
+./kodev fetch-thirdparty
 ```
 
-If the repository was cloned without submodules:
-
-```sh
-git submodule update --init --recursive
-```
+`fetch-thirdparty` checks out the public upstream `koreader-base` submodule and
+automatically applies this repository's native streaming patch queue. No second
+KOReader Stream repository or deploy key is required.
 
 Follow KOReader's upstream documentation for
 [build environment setup](doc/Building.md) and
@@ -56,8 +72,16 @@ checks are:
 ```
 
 For a Kobo Libra Colour, confirm the installed firmware before choosing
-`kobov4` or `kobov5`. Hardware behavior, suspend/resume, Wi-Fi recovery, memory
-limits, and battery impact must be validated on the device before deployment.
+the release. Only firmware 4.x is currently supported; upstream firmware-5
+support is not production-ready. Hardware behavior, suspend/resume, Wi-Fi
+recovery, memory limits, and battery impact must be validated on the device
+before deployment.
+
+Create the same package produced by GitHub Actions with:
+
+```sh
+./kodev release --ignore-translation kobo
+```
 
 ## Using WebDAV streaming
 

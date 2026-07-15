@@ -44,6 +44,9 @@ emu
 luacov.stats.out
 trace-out.txt
 koreader-*
+!/patches/
+!/patches/koreader-base/
+!/patches/koreader-base/*.patch
 
 i18n
 

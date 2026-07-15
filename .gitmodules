@@ -1,6 +1,8 @@
 [submodule "koreader-base"]
 	path = base
-	url = https://github.com/yoshitaka420/koreader-stream-base.git
+	url = https://github.com/koreader/koreader-base.git
+	# Native patches are applied to this checkout by fetchthirdparty.
+	ignore = dirty
 [submodule "platform/android/luajit-launcher"]
 	path = platform/android/luajit-launcher
 	url = https://github.com/koreader/android-luajit-launcher.git

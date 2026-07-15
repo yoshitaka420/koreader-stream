@@ -10,12 +10,14 @@ solid RAR may require reading most of the archive before a later page can be
 decoded. Strict CBR mode aborts an inefficient operation; it never falls back
 to a complete local download.
 
-The implementation is split across the pinned repositories:
+The implementation spans KOReader's normal frontend/base boundary, but all
+project-owned changes are tracked in this repository:
 
-- `koreader-base` owns libcurl, the seekable `fz_stream`, MuPDF FFI bindings,
-  bounded RAM cache, validators, telemetry, and native tests.
-- `koreader` owns WebDAV UI, descriptor identity, reader lifecycle, cache and
-  cover privacy, Wi-Fi leases, settings, and frontend tests.
+- the public `koreader-base` submodule plus `patches/koreader-base/` own
+  libcurl, the seekable `fz_stream`, MuPDF FFI bindings, bounded RAM cache,
+  validators, telemetry, and native tests;
+- the main tree owns WebDAV UI, descriptor identity, reader lifecycle, cache
+  and cover privacy, Wi-Fi leases, settings, and frontend tests.
 
 ## Revisions to the original plan
 
@@ -48,10 +50,10 @@ Source inspection and executable tests required these changes:
    entered the system allocator in KOReader's runtime. Normal hostname
    resolution and all target-device builds are unaffected.
 10. The original “hundreds, not thousands” line estimate was too optimistic.
-    The hardened implementation is roughly 1,900 production lines across both
-    forks, plus about 800 lines of adversarial and integration tests. Most of
-    that size is isolated in the native stream, descriptor lifecycle, and test
-    server rather than MuPDF.
+    The hardened implementation is roughly 1,900 production lines across the
+    frontend and native patch queue, plus about 800 lines of adversarial and
+    integration tests. Most of that size is isolated in the native stream,
+    descriptor lifecycle, and test server rather than MuPDF.
 
 ## Data flow
 
@@ -201,10 +203,11 @@ archive on its clean re-exec so it does not consume device storage.
 
 The emulator cannot establish the installed firmware generation, measure
 battery use, or exercise Kobo suspend and Wi-Fi drivers. Before distributing a
-package, validate on the actual Libra Colour and WebDAV service:
+package, validate the standard firmware-4 `kobo` build on the actual Libra
+Colour and WebDAV service:
 
-- choose `kobov4` for the supported firmware-4/Mk.7+ build or `kobov5` for a
-  firmware-5 installation, based on the device's actual firmware;
+- confirm the device is running firmware 4.x; firmware 5.x is not currently a
+  supported release target;
 - test ordinary and ZIP64 CBZ files with stored and deflated JPEG, PNG, and
   WebP pages;
 - test known non-solid RAR4/RAR5 and solid RAR fixtures;

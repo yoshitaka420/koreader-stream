@@ -1,0 +1,2104 @@
+From 7d1aeb17d8fa0e6740b4be2f73a4b7bf2efef11b Mon Sep 17 00:00:00 2001
+From: Yashraj Singh <73191510+yash0902singh@users.noreply.github.com>
+Date: Wed, 15 Jul 2026 18:07:15 +0530
+Subject: [PATCH] Add secure WebDAV range streaming
+
+---
+ .gitignore                                    |   9 +
+ README.md                                     |  16 +-
+ ffi-cdecl/wrap-mupdf_cdecl.c                  |  13 +
+ ffi/mupdf.lua                                 | 183 +++-
+ ffi/mupdf_h.lua                               |  61 ++
+ spec/support/webdav_range_server.py           | 216 +++++
+ spec/unit/webdav_range_stream_spec.lua        | 324 +++++++
+ .../cmake_modules/koreader_targets.cmake      |   5 +-
+ .../koreader_thirdparty_libs.cmake            |   9 +
+ thirdparty/curl/CMakeLists.txt                |   7 +-
+ .../curl/disable_macos_copyproxies.patch      |  11 +
+ webdav-range-stream.c                         | 867 ++++++++++++++++++
+ webdav-range-stream.h                         |  83 ++
+ wrap-mupdf.c                                  |  24 +
+ wrap-mupdf.h                                  |  17 +-
+ 15 files changed, 1834 insertions(+), 11 deletions(-)
+ create mode 100644 spec/support/webdav_range_server.py
+ create mode 100644 spec/unit/webdav_range_stream_spec.lua
+ create mode 100644 thirdparty/curl/disable_macos_copyproxies.patch
+ create mode 100644 webdav-range-stream.c
+ create mode 100644 webdav-range-stream.h
+
+diff --git a/.gitignore b/.gitignore
+index 70694896..dae8e0d8 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -1,5 +1,14 @@
+ .DS_*
+ ._*
++.env
++.env.*
++!.env.example
++*.key
++*.pem
++*.p12
++*.pfx
++credentials.*
++secrets.*
+ *.AppImage
+ *.gz
+ *.swp
+diff --git a/README.md b/README.md
+index a22e061f..f5071de2 100644
+--- a/README.md
++++ b/README.md
+@@ -1,6 +1,18 @@
+-## koreader-base [![CircleCI](https://circleci.com/gh/koreader/koreader-base.svg?style=svg)](https://circleci.com/gh/koreader/koreader-base)
++# KOReader Stream Base
+
+-This is the base framework for creating document readers like KOReader,
++This is the native companion repository for
++[KOReader Stream](https://github.com/yoshitaka420/koreader-stream). It extends
++KOReader's base framework with a libcurl-backed, seekable MuPDF stream for
++bounded WebDAV CBZ/CBR reading, including response validation, in-memory block
++caching, credential cleanup, telemetry, and adversarial tests.
++
++It is intended to be consumed as the main project's `base/` submodule. For the
++complete feature design and build instructions, see the main project README and
++`doc/WebDAV_comic_streaming.md` there.
++
++## Upstream framework
++
++This repository is based on the framework for creating document readers like KOReader,
+ an e-ink device oriented reader application for various document formats.
+
+ It uses the MuPDF library (see http://mupdf.com/), djvulibre library,
+diff --git a/ffi-cdecl/wrap-mupdf_cdecl.c b/ffi-cdecl/wrap-mupdf_cdecl.c
+index 8e346052..6d7e7d6c 100644
+--- a/ffi-cdecl/wrap-mupdf_cdecl.c
++++ b/ffi-cdecl/wrap-mupdf_cdecl.c
+@@ -50,6 +50,10 @@ cdecl_func(fz_runetochar)
+
+ /* document */
+ cdecl_type(fz_stream)
++cdecl_enum(mupdf_webdav_error)
++cdecl_type(mupdf_webdav_stream_options)
++cdecl_type(mupdf_webdav_probe_result)
++cdecl_type(mupdf_webdav_stream_stats)
+ cdecl_type(fz_location)
+ cdecl_type(fz_outline)
+ cdecl_struct(fz_outline)
+@@ -61,6 +65,15 @@ cdecl_type(fz_device)
+
+ cdecl_func(mupdf_open_document)
+ cdecl_func(mupdf_open_document_with_stream_and_dir)
++cdecl_func(mupdf_new_webdav_range_stream)
++cdecl_func(mupdf_probe_webdav_range)
++cdecl_func(mupdf_webdav_stream_finish_open)
++cdecl_func(mupdf_webdav_stream_begin_operation)
++cdecl_func(mupdf_webdav_stream_end_operation)
++cdecl_func(mupdf_webdav_stream_clear_cache)
++cdecl_func(mupdf_webdav_stream_get_stats)
++cdecl_func(mupdf_webdav_stream_last_error)
++cdecl_func(mupdf_empty_store)
+ cdecl_func(fz_is_document_reflowable)
+ cdecl_func(fz_needs_password)
+ cdecl_func(fz_authenticate_password)
+diff --git a/ffi/mupdf.lua b/ffi/mupdf.lua
+index 03988eaa..2f302bf7 100644
+--- a/ffi/mupdf.lua
++++ b/ffi/mupdf.lua
+@@ -87,19 +87,41 @@ local function context()
+ end
+
+ -- a wrapper for mupdf exception error messages
+-local function merror(ctx, message)
+-    error(string.format("%s: %s (%d)", message,
++local function merror_message(ctx, message)
++    return string.format("%s: %s (%d)", message,
+         ffi.string(W.mupdf_error_message(ctx)),
+-        W.mupdf_error_code(ctx)))
++        W.mupdf_error_code(ctx))
++end
++
++local function merror(ctx, message)
++    error(merror_message(ctx, message))
+ end
+
+-local function drop_document(ctx, doc)
++local function drop_document(ctx, doc, remote_stream)
+     -- Clear the cdata finalizer to avoid a double-free
+     ffi.gc(doc, nil)
+     M.fz_drop_document(ctx, doc)
++    if remote_stream ~= nil then
++        W.mupdf_webdav_stream_clear_cache(ctx, remote_stream)
++        W.mupdf_drop_stream(ctx, remote_stream)
++        -- MuPDF's store is shared by the context and may otherwise retain
++        -- decoded images after the remote archive itself has been closed.
++        W.mupdf_empty_store(ctx)
++    end
+     drop_context(ctx)
+ end
+
++local function drop_failed_remote_open(ctx, doc, remote_stream)
++    if doc ~= nil then
++        M.fz_drop_document(ctx, doc)
++    end
++    W.mupdf_webdav_stream_clear_cache(ctx, remote_stream)
++    W.mupdf_drop_stream(ctx, remote_stream)
++    -- An archive handler may have inserted partially decoded objects before
++    -- failing. Do not leave them in the context-wide store until a later GC.
++    W.mupdf_empty_store(ctx)
++end
++
+ local function drop_page(ctx, page)
+     -- Clear the cdata finalizer to avoid a double-free
+     ffi.gc(page, nil)
+@@ -134,6 +156,107 @@ function mupdf.openDocument(filename)
+     return mupdf_doc
+ end
+
++local function makeRemoteOptions(options)
++    assert(type(options) == "table", "remote document options must be a table")
++    assert(type(options.url) == "string" and options.url ~= "", "remote document URL is required")
++    local remote = ffi.new("mupdf_webdav_stream_options")
++    remote.url = options.url
++    remote.username = options.username or ""
++    remote.password = options.password or ""
++    remote.etag = options.etag or ""
++    remote.last_modified = options.last_modified or ""
++    remote.content_length = options.expected_size or options.content_length or 0
++    remote.block_size = options.block_size or 1024 * 1024
++    remote.cache_limit = options.cache_limit or 32 * 1024 * 1024
++    remote.opening_transfer_limit = options.opening_transfer_limit or 0
++    remote.operation_transfer_limit = options.operation_transfer_limit or 0
++    remote.connect_timeout_ms = options.connect_timeout_ms or 15000
++    remote.transfer_timeout_ms = options.transfer_timeout_ms or 60000
++    remote.strict_mode = options.strict_mode and 1 or 0
++    return remote
++end
++
++--- Perform a bounded one-byte range probe without opening a document.
++function mupdf.probeRemote(options)
++    local ctx = context()
++    local remote = makeRemoteOptions(options)
++    -- The native probe uses these values solely to validate its one-byte
++    -- response buffer; no block cache is retained.
++    remote.block_size = 1
++    remote.cache_limit = 1
++    local result = ffi.new("mupdf_webdav_probe_result")
++    if W.mupdf_probe_webdav_range(ctx, remote, result) == 0 then
++        merror(ctx, "Remote range probe failed")
++    end
++    return {
++        content_length = tonumber(result.content_length),
++        etag = result.etag[0] ~= 0 and ffi.string(result.etag) or nil,
++        last_modified = result.last_modified[0] ~= 0 and ffi.string(result.last_modified) or nil,
++        strong_etag = result.strong_etag ~= 0,
++        http_status = tonumber(result.http_status),
++    }
++end
++
++--- Open a seekable remote CBZ/CBR through MuPDF.
++function mupdf.openRemoteDocument(options)
++    local ctx = context()
++    local remote = makeRemoteOptions(options)
++    local stream = W.mupdf_new_webdav_range_stream(ctx, remote)
++    if stream == nil then
++        merror(ctx, "Cannot create remote range stream")
++    end
++
++    local magic = options.magic or options.display_name or ("remote." .. (options.extension or "cbz"))
++    local doc = W.mupdf_open_document_with_stream_and_dir(ctx, magic, stream, nil)
++    if doc == nil then
++        local remote_error = W.mupdf_webdav_stream_last_error(stream)
++        local message
++        if remote_error ~= nil and remote_error[0] ~= 0 then
++            -- Archive handlers may translate a stream exception into a
++            -- generic "cannot recognize archive" error. Preserve the
++            -- actionable range/auth/strict-limit failure instead.
++            message = ffi.string(remote_error)
++        else
++            message = merror_message(ctx, "MuPDF cannot open remote document")
++        end
++        drop_failed_remote_open(ctx, nil, stream)
++        error(message)
++    end
++
++    -- Counting pages can force lazy archive indexing, so it remains part of
++    -- the opening budget. Do it before installing Lua finalizers so every
++    -- failure path can release native resources synchronously.
++    local pages = W.mupdf_count_pages(ctx, doc)
++    local remote_error = W.mupdf_webdav_stream_last_error(stream)
++    if (remote_error ~= nil and remote_error[0] ~= 0) or pages <= 0 then
++        local message
++        if remote_error ~= nil and remote_error[0] ~= 0 then
++            message = ffi.string(remote_error)
++        elseif pages == -1 then
++            message = merror_message(ctx, "cannot access remote page tree")
++        else
++            message = "MuPDF found no pages in remote file"
++        end
++        drop_failed_remote_open(ctx, doc, stream)
++        error(message)
++    end
++
++    W.mupdf_webdav_stream_finish_open(stream)
++    local mupdf_doc = {
++        doc = doc,
++        filename = options.display_name,
++        remote_stream = stream,
++        number_of_pages = pages,
++    }
++    mupdf_doc.doc = ffi.gc(mupdf_doc.doc, function(document)
++        drop_document(ctx, document, stream)
++    end)
++    mupdf_doc.ctx = keep_context(ctx)
++    setmetatable(mupdf_doc, document_mt)
++
++    return mupdf_doc
++end
++
+ function mupdf.openDocumentFromText(text, magic, html_resource_directory)
+     local ctx = context()
+     local stream = W.mupdf_open_memory(ctx, ffi.cast("const unsigned char*", text), #text)
+@@ -175,12 +298,46 @@ triggered explicitly
+ --]]
+ function document_mt.__index:close()
+     if self.doc ~= nil then
+-        drop_document(self.ctx, self.doc)
++        drop_document(self.ctx, self.doc, self.remote_stream)
+         self.doc = nil
+         self.ctx = nil
++        self.remote_stream = nil
+     end
+ end
+
++function document_mt.__index:getNetworkStats()
++    if self.remote_stream == nil then return end
++    local stats = ffi.new("mupdf_webdav_stream_stats")
++    if W.mupdf_webdav_stream_get_stats(self.remote_stream, stats) == 0 then return end
++    return {
++        content_length = tonumber(stats.content_length),
++        request_count = tonumber(stats.request_count),
++        retry_count = tonumber(stats.retry_count),
++        bytes_received = tonumber(stats.bytes_received),
++        cache_hits = tonumber(stats.cache_hits),
++        cache_misses = tonumber(stats.cache_misses),
++        cached_bytes = tonumber(stats.cached_bytes),
++        peak_cached_bytes = tonumber(stats.peak_cached_bytes),
++        opening_bytes = tonumber(stats.opening_bytes),
++        operation_limit_hits = tonumber(stats.operation_limit_hits),
++        longest_sequential_run = tonumber(stats.longest_sequential_run),
++        last_http_status = tonumber(stats.last_http_status),
++        error_code = tonumber(stats.error_code),
++    }
++end
++
++function document_mt.__index:clearRemoteCache()
++    if self.remote_stream ~= nil then
++        W.mupdf_webdav_stream_clear_cache(self.ctx, self.remote_stream)
++    end
++end
++
++function document_mt.__index:getRemoteError()
++    if self.remote_stream == nil then return end
++    local message = W.mupdf_webdav_stream_last_error(self.remote_stream)
++    return message ~= nil and ffi.string(message) or nil
++end
++
+ --[[
+ check if the document needs a password for access
+ --]]
+@@ -272,11 +429,27 @@ open a page, return page object
+ --]]
+ function document_mt.__index:openPage(number)
+     local ctx = self.ctx
++    if self.remote_stream ~= nil then
++        W.mupdf_webdav_stream_begin_operation(self.remote_stream)
++    end
+     local mupdf_page = {
+         page = W.mupdf_load_page(ctx, self.doc, number-1),
+         number = number,
+         doc = self,
+     }
++    if self.remote_stream ~= nil then
++        W.mupdf_webdav_stream_end_operation(self.remote_stream)
++        -- MuPDF's comic reader intentionally turns image/archive failures into
++        -- blank pages. A strict streaming limit is different: it must be
++        -- visible to the caller instead of silently presenting a blank page.
++        local remote_error = W.mupdf_webdav_stream_last_error(self.remote_stream)
++        if remote_error ~= nil and remote_error[0] ~= 0 then
++            if mupdf_page.page ~= nil then
++                M.fz_drop_page(ctx, mupdf_page.page)
++            end
++            error(ffi.string(remote_error))
++        end
++    end
+
+     if mupdf_page.page == nil then
+         merror(ctx, "cannot open page #" .. number)
+diff --git a/ffi/mupdf_h.lua b/ffi/mupdf_h.lua
+index 2ddc1ab5..529fd50f 100644
+--- a/ffi/mupdf_h.lua
++++ b/ffi/mupdf_h.lua
+@@ -60,6 +60,58 @@ fz_pixmap *mupdf_get_pixmap_from_image(fz_context *, fz_image *, const fz_irect
+ void fz_drop_image(fz_context *, fz_image *);
+ int fz_runetochar(char *, int);
+ typedef struct fz_stream fz_stream;
++typedef enum {
++  MUPDF_WEBDAV_ERROR_NONE = 0,
++  MUPDF_WEBDAV_ERROR_ARGUMENT = 1,
++  MUPDF_WEBDAV_ERROR_NO_RANGE = 2,
++  MUPDF_WEBDAV_ERROR_AUTH = 3,
++  MUPDF_WEBDAV_ERROR_CHANGED = 4,
++  MUPDF_WEBDAV_ERROR_TLS = 5,
++  MUPDF_WEBDAV_ERROR_TIMEOUT = 6,
++  MUPDF_WEBDAV_ERROR_NETWORK = 7,
++  MUPDF_WEBDAV_ERROR_RESPONSE = 8,
++  MUPDF_WEBDAV_ERROR_LIMIT = 9,
++  MUPDF_WEBDAV_ERROR_UNAVAILABLE = 10
++} mupdf_webdav_error;
++typedef struct mupdf_webdav_stream_options {
++  const char *url;
++  const char *username;
++  const char *password;
++  const char *etag;
++  const char *last_modified;
++  int64_t content_length;
++  size_t block_size;
++  size_t cache_limit;
++  uint64_t opening_transfer_limit;
++  uint64_t operation_transfer_limit;
++  long connect_timeout_ms;
++  long transfer_timeout_ms;
++  int strict_mode;
++} mupdf_webdav_stream_options;
++typedef struct mupdf_webdav_probe_result {
++  int64_t content_length;
++  int strong_etag;
++  int error_code;
++  long http_status;
++  char etag[512];
++  char last_modified[128];
++  char error_message[256];
++} mupdf_webdav_probe_result;
++typedef struct mupdf_webdav_stream_stats {
++  int64_t content_length;
++  uint64_t request_count;
++  uint64_t retry_count;
++  uint64_t bytes_received;
++  uint64_t cache_hits;
++  uint64_t cache_misses;
++  uint64_t cached_bytes;
++  uint64_t peak_cached_bytes;
++  uint64_t opening_bytes;
++  uint64_t operation_limit_hits;
++  uint64_t longest_sequential_run;
++  long last_http_status;
++  int error_code;
++} mupdf_webdav_stream_stats;
+ typedef struct {
+   int chapter;
+   int page;
+@@ -92,6 +144,15 @@ typedef struct fz_document fz_document;
+ typedef struct fz_device fz_device;
+ fz_document *mupdf_open_document(fz_context *, const char *);
+ fz_document *mupdf_open_document_with_stream_and_dir(fz_context *, const char *, fz_stream *, fz_archive *);
++fz_stream *mupdf_new_webdav_range_stream(fz_context *, const mupdf_webdav_stream_options *);
++int mupdf_probe_webdav_range(fz_context *, const mupdf_webdav_stream_options *, mupdf_webdav_probe_result *);
++void mupdf_webdav_stream_finish_open(fz_stream *);
++void mupdf_webdav_stream_begin_operation(fz_stream *);
++void mupdf_webdav_stream_end_operation(fz_stream *);
++void mupdf_webdav_stream_clear_cache(fz_context *, fz_stream *);
++int mupdf_webdav_stream_get_stats(fz_stream *, mupdf_webdav_stream_stats *);
++const char *mupdf_webdav_stream_last_error(fz_stream *);
++void *mupdf_empty_store(fz_context *);
+ int fz_is_document_reflowable(fz_context *, fz_document *);
+ int fz_needs_password(fz_context *, fz_document *);
+ int fz_authenticate_password(fz_context *, fz_document *, const char *);
+diff --git a/spec/support/webdav_range_server.py b/spec/support/webdav_range_server.py
+new file mode 100644
+index 00000000..e740528d
+--- /dev/null
++++ b/spec/support/webdav_range_server.py
+@@ -0,0 +1,216 @@
++#!/usr/bin/env python3
++"""Small adversarial HTTP/WebDAV range server used by KOReader tests.
++
++It deliberately logs only whether Authorization was present, never its value.
++"""
++
++from __future__ import annotations
++
++import argparse
++import base64
++import json
++import os
++import re
++import socket
++import threading
++import time
++import urllib.parse
++from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
++
++
++ETAG = '"fixture-v1"'
++CHANGED_ETAG = '"fixture-v2"'
++LAST_MODIFIED = "Wed, 15 Jul 2026 00:00:00 GMT"
++CHANGED_LAST_MODIFIED = "Thu, 16 Jul 2026 00:00:00 GMT"
++RANGE_RE = re.compile(r"^bytes=(\d+)-(\d*)$")
++
++
++class FixtureServer(ThreadingHTTPServer):
++    daemon_threads = True
++
++    def __init__(self, address, handler, args):
++        super().__init__(address, handler)
++        self.args = args
++        with open(args.file, "rb") as fixture:
++            self.payload = fixture.read()
++        self.log_lock = threading.Lock()
++
++    def log_request_data(self, record):
++        if not self.args.log_file:
++            return
++        with self.log_lock, open(self.args.log_file, "a", encoding="utf-8") as log:
++            log.write(json.dumps(record, sort_keys=True) + "\n")
++            log.flush()
++
++
++class Handler(BaseHTTPRequestHandler):
++    protocol_version = "HTTP/1.1"
++    server_version = "KOReaderRangeFixture/1"
++
++    def log_message(self, _format, *_args):
++        return
++
++    def _authorized(self):
++        if self.server.args.allow_anonymous:
++            return True
++        token = base64.b64encode(
++            f"{self.server.args.username}:{self.server.args.password}".encode()
++        ).decode()
++        return self.headers.get("Authorization") == f"Basic {token}"
++
++    def _reject_auth(self):
++        self.send_response(401)
++        self.send_header("WWW-Authenticate", 'Basic realm="KOReader test"')
++        self.send_header("Content-Length", "0")
++        self.send_header("Connection", "close")
++        self.end_headers()
++        self.server.log_request_data(self._record(401, 0))
++
++    def _record(self, status, sent, mode=None):
++        return {
++            "authorization_present": self.headers.get("Authorization") is not None,
++            "bytes_sent": sent,
++            "if_range": self.headers.get("If-Range"),
++            "method": self.command,
++            "mode": mode,
++            "path": self.path,
++            "range": self.headers.get("Range"),
++            "status": status,
++        }
++
++    def do_PROPFIND(self):
++        if not self._authorized():
++            self._reject_auth()
++            return
++        size = len(self.server.payload)
++        body = f'''<?xml version="1.0" encoding="utf-8"?>
++<d:multistatus xmlns:d="DAV:"><d:response><d:href>/book.cbz</d:href>
++<d:propstat><d:prop><d:resourcetype/><d:getcontentlength>{size}</d:getcontentlength>
++<d:getlastmodified>{LAST_MODIFIED}</d:getlastmodified><d:getetag>{ETAG}</d:getetag>
++</d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat></d:response></d:multistatus>'''.encode()
++        self.send_response(207)
++        self.send_header("Content-Type", "application/xml")
++        self.send_header("Content-Length", str(len(body)))
++        self.send_header("Connection", "close")
++        self.end_headers()
++        self.wfile.write(body)
++        self.server.log_request_data(self._record(207, len(body)))
++
++    def do_GET(self):
++        if not self._authorized():
++            self._reject_auth()
++            return
++
++        parsed = urllib.parse.urlsplit(self.path)
++        query = urllib.parse.parse_qs(parsed.query)
++        mode = query.get("mode", [""])[0]
++        if parsed.path == "/redirect":
++            target = query.get("target", ["/book.cbz"])[0]
++            self.send_response(302)
++            self.send_header("Location", target)
++            self.send_header("Content-Length", "0")
++            self.send_header("Connection", "close")
++            self.end_headers()
++            self.server.log_request_data(self._record(302, 0, mode))
++            return
++        if mode == "missing":
++            self.send_response(404)
++            self.send_header("Content-Length", "0")
++            self.send_header("Connection", "close")
++            self.end_headers()
++            self.server.log_request_data(self._record(404, 0, mode))
++            return
++
++        payload = self.server.payload
++        total = len(payload)
++        etag = CHANGED_ETAG if mode == "changed" else ETAG
++        last_modified = (
++            CHANGED_LAST_MODIFIED if mode == "changed-last-modified" else LAST_MODIFIED
++        )
++        range_header = self.headers.get("Range")
++        if_range = self.headers.get("If-Range")
++        ignore_range = mode == "ignore" or (if_range and if_range not in (etag, LAST_MODIFIED))
++
++        start, end, status = 0, total - 1, 200
++        if range_header and not ignore_range:
++            match = RANGE_RE.match(range_header)
++            if not match:
++                self.send_error(400)
++                return
++            start = int(match.group(1))
++            end = int(match.group(2) or total - 1)
++            if start >= total or end < start:
++                self.send_response(416)
++                self.send_header("Content-Range", f"bytes */{total}")
++                self.send_header("Content-Length", "0")
++                self.send_header("Connection", "close")
++                self.end_headers()
++                self.server.log_request_data(self._record(416, 0, mode))
++                return
++            end = min(end, total - 1)
++            status = 206
++
++        body = payload[start : end + 1]
++        advertised_length = len(body)
++        if mode == "truncate" and status == 206 and body:
++            body = body[:-1]
++
++        self.send_response(status)
++        self.send_header("Accept-Ranges", "bytes")
++        if mode != "no-etag":
++            self.send_header("ETag", etag)
++        if mode != "no-last-modified":
++            self.send_header("Last-Modified", last_modified)
++        self.send_header("Content-Type", "application/vnd.comicbook+zip")
++        self.send_header("Content-Length", str(advertised_length))
++        if status == 206:
++            range_start = start + 1 if mode == "bad-range" else start
++            self.send_header("Content-Range", f"bytes {range_start}-{end}/{total}")
++        self.send_header("Connection", "close")
++        self.end_headers()
++
++        sent = 0
++        try:
++            limit = len(body) // 2 if mode == "drop" else len(body)
++            while sent < limit:
++                chunk = body[sent : min(sent + 16384, limit)]
++                self.wfile.write(chunk)
++                self.wfile.flush()
++                sent += len(chunk)
++                if mode == "slow":
++                    time.sleep(0.01)
++            if mode == "drop":
++                self.connection.shutdown(socket.SHUT_RDWR)
++                self.connection.close()
++        except (BrokenPipeError, ConnectionResetError, OSError):
++            pass
++        finally:
++            self.server.log_request_data(self._record(status, sent, mode))
++
++
++def main():
++    parser = argparse.ArgumentParser()
++    parser.add_argument("--file", required=True)
++    parser.add_argument("--port", type=int, default=0)
++    parser.add_argument("--port-file", required=True)
++    parser.add_argument("--log-file")
++    parser.add_argument("--username", default="reader")
++    parser.add_argument("--password", default="secret")
++    parser.add_argument("--allow-anonymous", action="store_true")
++    args = parser.parse_args()
++
++    server = FixtureServer(("127.0.0.1", args.port), Handler, args)
++    port_tmp = args.port_file + ".tmp"
++    with open(port_tmp, "w", encoding="ascii") as output:
++        output.write(str(server.server_port))
++        output.flush()
++        os.fsync(output.fileno())
++    os.replace(port_tmp, args.port_file)
++    try:
++        server.serve_forever(poll_interval=0.05)
++    finally:
++        server.server_close()
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/spec/unit/webdav_range_stream_spec.lua b/spec/unit/webdav_range_stream_spec.lua
+new file mode 100644
+index 00000000..2b876a15
+--- /dev/null
++++ b/spec/unit/webdav_range_stream_spec.lua
+@@ -0,0 +1,324 @@
++local Archiver = require("ffi/archiver")
++local DrawContext = require("ffi/drawcontext")
++local M = require("ffi/mupdf")
++local ffiUtil = require("ffi/util")
++local lfs = require("libs/libkoreader-lfs")
++
++local function shellQuote(value)
++    return "'" .. tostring(value):gsub("'", "'\\''") .. "'"
++end
++
++local function readFile(path)
++    local file = assert(io.open(path, "rb"))
++    local data = file:read("*all")
++    file:close()
++    return data
++end
++
++local function waitForFile(path)
++    for _ = 1, 200 do
++        local file = io.open(path, "rb")
++        if file then
++            local value = file:read("*all")
++            file:close()
++            if value ~= "" then return value end
++        end
++        ffiUtil.usleep(25000)
++    end
++end
++
++local function waitForLogValue(path, pattern)
++    for _ = 1, 200 do
++        local file = io.open(path, "rb")
++        if file then
++            local data = file:read("*all")
++            file:close()
++            local value = data:match(pattern)
++            if value then return tonumber(value) end
++        end
++        ffiUtil.usleep(25000)
++    end
++end
++
++local function startServer(fixture, allow_anonymous)
++    local port_file = os.tmpname()
++    local log_file = os.tmpname()
++    os.remove(port_file)
++    os.remove(log_file)
++    local args = {
++        os.getenv("PYTHON") or "python3",
++        "spec/base/support/webdav_range_server.py",
++        "--file", fixture,
++        "--port-file", port_file,
++        "--log-file", log_file,
++    }
++    if allow_anonymous then table.insert(args, "--allow-anonymous") end
++    local escaped = {}
++    for _, arg in ipairs(args) do table.insert(escaped, shellQuote(arg)) end
++    local command = table.concat(escaped, " ")
++    local pid = ffiUtil.runInSubProcess(function()
++        os.execute(command)
++    end)
++    assert.is_truthy(pid)
++    local port = tonumber(waitForFile(port_file))
++    assert.is_truthy(port)
++    return {
++        pid = pid,
++        port = port,
++        port_file = port_file,
++        log_file = log_file,
++    }
++end
++
++local function stopServer(server)
++    if not server then return end
++    ffiUtil.terminateSubProcess(server.pid)
++    ffiUtil.isSubProcessDone(server.pid, true)
++    os.remove(server.port_file)
++    os.remove(server.log_file)
++end
++
++local function urlEncode(value)
++    return (value:gsub("([^%w%-%.%_%~])", function(char)
++        return string.format("%%%02X", string.byte(char))
++    end))
++end
++
++local function assertErrorContains(ok, err, text)
++    assert.is_false(ok)
++    assert.is_truthy(tostring(err):find(text, 1, true), tostring(err))
++end
++
++describe("MuPDF WebDAV range stream", function()
++    local fixture
++    local fixture_size
++    local server
++    local anonymous_server
++    local base_url
++    local standard_options
++
++    setup(function()
++        local home = assert(os.getenv("KO_HOME"))
++        fixture = home .. "/webdav-range-test.cbz"
++        local image = readFile("spec/base/unit/data/sample.jpg")
++        local writer = Archiver.Writer:new()
++        assert.is_true(writer:open(fixture, "zip"))
++        assert.is_true(writer:setZipCompression("store"))
++        assert.is_true(writer:addFileFromMemory("pages/001.jpg", image))
++        assert.is_true(writer:addFileFromMemory("padding-1.bin", string.rep("A", 2 * 1024 * 1024)))
++        assert.is_true(writer:setZipCompression("deflate"))
++        assert.is_true(writer:addFileFromMemory("pages/002.jpg", image))
++        assert.is_true(writer:setZipCompression("store"))
++        assert.is_true(writer:addFileFromMemory("padding-2.bin", string.rep("B", 2 * 1024 * 1024)))
++        assert.is_true(writer:setZipCompression("deflate"))
++        assert.is_true(writer:addFileFromMemory("pages/003.jpg", image))
++        writer:close()
++        fixture_size = assert(lfs.attributes(fixture, "size"))
++
++        server = startServer(fixture, false)
++        anonymous_server = startServer(fixture, true)
++        base_url = string.format("http://127.0.0.1:%d", server.port)
++        standard_options = {
++            url = base_url .. "/book.cbz",
++            username = "reader",
++            password = "secret",
++            expected_size = fixture_size,
++            etag = '"fixture-v1"',
++            last_modified = "Wed, 15 Jul 2026 00:00:00 GMT",
++            magic = "book.cbz",
++            display_name = "book.cbz",
++            extension = "cbz",
++            block_size = 64 * 1024,
++            cache_limit = 128 * 1024,
++        }
++    end)
++
++    teardown(function()
++        stopServer(server)
++        stopServer(anonymous_server)
++        if fixture then os.remove(fixture) end
++    end)
++
++    it("probes one byte and reports validators", function()
++        local result = M.probeRemote(standard_options)
++        assert.equals(fixture_size, result.content_length)
++        assert.equals('"fixture-v1"', result.etag)
++        assert.equals("Wed, 15 Jul 2026 00:00:00 GMT", result.last_modified)
++        assert.is_true(result.strong_etag)
++        assert.equals(206, result.http_status)
++    end)
++
++    it("renders arbitrary CBZ pages without transferring the archive", function()
++        local doc = M.openRemoteDocument(standard_options)
++        assert.equals(3, doc:getPages())
++        local dc = DrawContext.new()
++        for _, number in ipairs({ 1, 3, 2, 1 }) do
++            local page = doc:openPage(number)
++            local width, height = page:getSize(dc)
++            assert.is_true(width > 0 and height > 0)
++            page:close()
++        end
++        local stats = doc:getNetworkStats()
++        assert.is_true(stats.bytes_received < fixture_size)
++        assert.is_true(stats.request_count > 1)
++        assert.is_true(stats.peak_cached_bytes <= standard_options.cache_limit)
++        assert.is_true(stats.cached_bytes <= standard_options.cache_limit)
++        doc:clearRemoteCache()
++        assert.equals(0, doc:getNetworkStats().cached_bytes)
++        doc:close()
++    end)
++
++    it("repeatedly opens and closes without retaining native blocks", function()
++        for _ = 1, 5 do
++            local doc = M.openRemoteDocument(standard_options)
++            local page = doc:openPage(2)
++            page:close()
++            doc:close()
++        end
++    end)
++
++    it("rejects ignored ranges, bad ranges, truncation, auth failures, and changes", function()
++        local ok, err = pcall(M.probeRemote, {
++            url = base_url .. "/book.cbz?mode=ignore",
++            username = "reader", password = "secret", expected_size = fixture_size,
++        })
++        assertErrorContains(ok, err, "ignored the byte range")
++        local ignored_bytes = assert(waitForLogValue(server.log_file,
++            '"bytes_sent": (%d+)[^\n]-"mode": "ignore"'))
++        assert.is_true(ignored_bytes < fixture_size)
++
++        ok, err = pcall(M.probeRemote, {
++            url = base_url .. "/book.cbz?mode=bad-range",
++            username = "reader", password = "secret", expected_size = fixture_size,
++        })
++        assertErrorContains(ok, err, "Content-Range does not match")
++
++        ok, err = pcall(M.probeRemote, {
++            url = base_url .. "/book.cbz?mode=truncate",
++            username = "reader", password = "secret", expected_size = fixture_size,
++        })
++        assertErrorContains(ok, err, "truncated byte range")
++
++        ok, err = pcall(M.probeRemote, {
++            url = base_url .. "/book.cbz",
++            username = "reader", password = "wrong", expected_size = fixture_size,
++        })
++        assertErrorContains(ok, err, "authentication failed")
++
++        ok, err = pcall(M.probeRemote, {
++            url = base_url .. "/book.cbz?mode=changed",
++            username = "reader", password = "secret", expected_size = fixture_size,
++            etag = '"fixture-v1"',
++        })
++        assertErrorContains(ok, err, "remote file changed")
++
++        ok, err = pcall(M.probeRemote, {
++            url = base_url .. "/book.cbz",
++            username = "reader", password = "secret", expected_size = fixture_size + 1,
++        })
++        assertErrorContains(ok, err, "remote file size changed")
++
++        ok, err = pcall(M.probeRemote, {
++            url = base_url .. "/book.cbz?mode=missing",
++            username = "reader", password = "secret", expected_size = fixture_size,
++        })
++        assertErrorContains(ok, err, "remote file is unavailable")
++
++        ok, err = pcall(M.probeRemote, {
++            url = base_url .. "/book.cbz?mode=no-etag",
++            username = "reader", password = "secret", expected_size = fixture_size,
++            etag = '"fixture-v1"',
++        })
++        assertErrorContains(ok, err, "omitted the expected ETag")
++
++        ok, err = pcall(M.probeRemote, {
++            url = base_url .. "/book.cbz?mode=changed-last-modified",
++            username = "reader", password = "secret", expected_size = fixture_size,
++            last_modified = "Wed, 15 Jul 2026 00:00:00 GMT",
++        })
++        assertErrorContains(ok, err, "Last-Modified value changed")
++
++        ok, err = pcall(M.probeRemote, {
++            url = base_url .. "/book.cbz?mode=no-last-modified",
++            username = "reader", password = "secret", expected_size = fixture_size,
++            last_modified = "Wed, 15 Jul 2026 00:00:00 GMT",
++        })
++        assertErrorContains(ok, err, "omitted the expected Last-Modified")
++
++        ok, err = pcall(M.probeRemote, {
++            url = base_url .. "/book.cbz?mode=drop",
++            username = "reader", password = "secret", expected_size = fixture_size,
++        })
++        assertErrorContains(ok, err, "truncated byte range")
++    end)
++
++    it("does not forward credentials across an origin-changing redirect", function()
++        local target = string.format("http://127.0.0.1:%d/book.cbz", anonymous_server.port)
++        local result = M.probeRemote({
++            url = base_url .. "/redirect?target=" .. urlEncode(target),
++            username = "reader",
++            password = "secret",
++            expected_size = fixture_size,
++        })
++        assert.equals(fixture_size, result.content_length)
++        ffiUtil.usleep(50000)
++        local log = readFile(anonymous_server.log_file)
++        assert.is_nil(log:find('"authorization_present": true', 1, true))
++        assert.is_truthy(log:find('"authorization_present": false', 1, true))
++    end)
++
++    it("streams through a redirect using Last-Modified when GET omits ETag", function()
++        local target = string.format("http://127.0.0.1:%d/book.cbz?mode=no-etag",
++            anonymous_server.port)
++        local options = {
++            url = base_url .. "/redirect?target=" .. urlEncode(target),
++            username = "reader",
++            password = "secret",
++            expected_size = fixture_size,
++            last_modified = "Wed, 15 Jul 2026 00:00:00 GMT",
++            magic = "redirected.cbz",
++            extension = "cbz",
++            block_size = 64 * 1024,
++            cache_limit = 128 * 1024,
++        }
++        local doc = M.openRemoteDocument(options)
++        assert.equals(3, doc:getPages())
++        local page = doc:openPage(2)
++        page:close()
++        assert.is_true(doc:getNetworkStats().bytes_received < fixture_size)
++        doc:close()
++    end)
++
++    it("ignores weak ETags and validates Last-Modified instead", function()
++        local result = M.probeRemote({
++            url = base_url .. "/book.cbz?mode=no-etag",
++            username = "reader",
++            password = "secret",
++            expected_size = fixture_size,
++            etag = 'W/"fixture-v1"',
++            last_modified = "Wed, 15 Jul 2026 00:00:00 GMT",
++        })
++        assert.equals(206, result.http_status)
++        assert.is_nil(result.etag)
++        assert.equals("Wed, 15 Jul 2026 00:00:00 GMT", result.last_modified)
++    end)
++
++    it("surfaces strict transfer ceilings instead of returning blank pages", function()
++        local opening_options = {}
++        for key, value in pairs(standard_options) do opening_options[key] = value end
++        opening_options.strict_mode = true
++        opening_options.opening_transfer_limit = 1
++        local ok, err = pcall(M.openRemoteDocument, opening_options)
++        assertErrorContains(ok, err, "opening transfer limit exceeded")
++
++        local page_options = {}
++        for key, value in pairs(standard_options) do page_options[key] = value end
++        page_options.strict_mode = true
++        page_options.operation_transfer_limit = 1
++        local doc = M.openRemoteDocument(page_options)
++        doc:clearRemoteCache()
++        ok, err = pcall(doc.openPage, doc, 2)
++        assertErrorContains(ok, err, "page transfer limit exceeded")
++        doc:close()
++    end)
++end)
+diff --git a/thirdparty/cmake_modules/koreader_targets.cmake b/thirdparty/cmake_modules/koreader_targets.cmake
+index 4e405fc8..05735166 100644
+--- a/thirdparty/cmake_modules/koreader_targets.cmake
++++ b/thirdparty/cmake_modules/koreader_targets.cmake
+@@ -158,8 +158,8 @@ declare_koreader_target(
+ # wrap-mupdf
+ declare_koreader_target(
+     wrap-mupdf TYPE monolibtic
+-    DEPENDS mupdf::mupdf
+-    SOURCES wrap-mupdf.c
++    DEPENDS curl::curl mupdf::mupdf
++    SOURCES wrap-mupdf.c webdav-range-stream.c
+     VISIBILITY hidden
+ )
+ function(setup_wrap_mupdf)
+@@ -245,6 +245,7 @@ if(MONOLIBTIC)
+         # We still need to manually add some transitive dependencies because
+         # CMake is shit at handling mutiple level of static libraries.
+         libarchive::libarchive
++        curl::curl
+         czmq::czmq
+         freetype2::freetype
+         giflib::gif
+diff --git a/thirdparty/cmake_modules/koreader_thirdparty_libs.cmake b/thirdparty/cmake_modules/koreader_thirdparty_libs.cmake
+index e69b7421..4e403b43 100644
+--- a/thirdparty/cmake_modules/koreader_thirdparty_libs.cmake
++++ b/thirdparty/cmake_modules/koreader_thirdparty_libs.cmake
+@@ -66,6 +66,15 @@ if(NOT APPLE AND NOT ANDROID)
+ endif()
+ declare_dependency(czmq::czmq MONOLIBTIC czmq zmq LIBRARIES ${LIBRARIES})
+
++# curl
++# curl is built as PIC static code and linked into wrap-mupdf. Keep its
++# transitive TLS and compression dependencies explicit for monolibtic builds.
++declare_dependency(
++    curl::curl
++    STATIC curl
++    LIBRARIES libressl::ssl libressl::crypto zlib::z pthread
++)
++
+ # djvulibre
+ set(LIBRARIES m pthread)
+ if(NOT (ANDROID AND MONOLIBTIC))
+diff --git a/thirdparty/curl/CMakeLists.txt b/thirdparty/curl/CMakeLists.txt
+index 207a0564..bd9eb585 100644
+--- a/thirdparty/curl/CMakeLists.txt
++++ b/thirdparty/curl/CMakeLists.txt
+@@ -4,6 +4,10 @@ list(APPEND PATCH_FILES
+     # Use `-pthread` flag, not `-lpthread`
+     # to avoid conflicts with OpenSSL.
+     use_-pthread.patch
++    # Curl's macOS NAT64 workaround calls SCDynamicStoreCopyProxies during
++    # lazy global initialization. In KOReader's process this can recurse in
++    # the system allocator; hostname resolution does not require the call.
++    disable_macos_copyproxies.patch
+ )
+ if(LEGACY OR POCKETBOOK)
+     # Avoid pulling-in `eventfd@GLIBC_2.7` or `pipe2@GLIBC_2.9`.
+@@ -12,8 +16,9 @@ endif()
+
+ list(APPEND CMAKE_ARGS
+     -DCMAKE_TOOLCHAIN_FILE=${CMAKE_TOOLCHAIN_FILE}
+-    # Build a static library, since there's only one user (zsync2).
++    # Build PIC static code: zsync2 and wrap-mupdf both consume libcurl.
+     -DBUILD_SHARED_LIBS=FALSE
++    -DCMAKE_POSITION_INDEPENDENT_CODE=ON
+     # Project options.
+     # TODO: Enable ZSTD support? We currently only use cURL
+     # for zsync2, so, obviously, not necessary right now…
+diff --git a/thirdparty/curl/disable_macos_copyproxies.patch b/thirdparty/curl/disable_macos_copyproxies.patch
+new file mode 100644
+index 00000000..2f42cf69
+--- /dev/null
++++ b/thirdparty/curl/disable_macos_copyproxies.patch
+@@ -0,0 +1,11 @@
++--- a/lib/curl_setup.h
+++++ b/lib/curl_setup.h
++@@ -381,8 +381,4 @@
++  */
++ #if defined(__APPLE__) && !defined(USE_ARES)
++ #define USE_RESOLVE_ON_IPS 1
++-#  if TARGET_OS_MAC && !(defined(TARGET_OS_IPHONE) && TARGET_OS_IPHONE) && \
++-     defined(USE_IPV6)
++-#    define CURL_MACOS_CALL_COPYPROXIES 1
++-#  endif
++ #endif
+diff --git a/webdav-range-stream.c b/webdav-range-stream.c
+new file mode 100644
+index 00000000..b474b40a
+--- /dev/null
++++ b/webdav-range-stream.c
+@@ -0,0 +1,867 @@
++#include "webdav-range-stream.h"
++
++#include <curl/curl.h>
++
++#include <ctype.h>
++#include <inttypes.h>
++#include <limits.h>
++#include <pthread.h>
++#include <stdarg.h>
++#include <stdbool.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <strings.h>
++
++typedef struct range_block {
++    int64_t index;
++    size_t length;
++    unsigned char *data;
++    struct range_block *newer;
++    struct range_block *older;
++} range_block;
++
++typedef struct webdav_range_state {
++    char *url;
++    char *username;
++    char *password;
++    char *etag;
++    char *last_modified;
++    int strong_etag;
++
++    int64_t content_length;
++    size_t block_size;
++    size_t cache_limit;
++    size_t cached_bytes;
++    size_t peak_cached_bytes;
++    range_block *newest;
++    range_block *oldest;
++
++    CURL *curl;
++    long connect_timeout_ms;
++    long transfer_timeout_ms;
++    int initial_url_is_https;
++
++    uint64_t opening_transfer_limit;
++    uint64_t operation_transfer_limit;
++    uint64_t operation_start_bytes;
++    int strict_mode;
++    int opening_phase;
++    int operation_active;
++
++    uint64_t request_count;
++    uint64_t retry_count;
++    uint64_t bytes_received;
++    uint64_t cache_hits;
++    uint64_t cache_misses;
++    uint64_t opening_bytes;
++    uint64_t operation_limit_hits;
++    uint64_t sequential_run;
++    uint64_t longest_sequential_run;
++    int64_t last_miss_index;
++    long last_http_status;
++
++    int error_code;
++    char error_message[MUPDF_WEBDAV_ERROR_MAX];
++
++    char response_content_range[128];
++    char response_etag[MUPDF_WEBDAV_ETAG_MAX];
++    char response_last_modified[MUPDF_WEBDAV_LAST_MODIFIED_MAX];
++    int response_header_too_long;
++
++    unsigned char empty[1];
++} webdav_range_state;
++
++typedef struct write_target {
++    webdav_range_state *state;
++    unsigned char *data;
++    size_t capacity;
++    size_t length;
++} write_target;
++
++static pthread_once_t curl_once = PTHREAD_ONCE_INIT;
++static CURLcode curl_global_status = CURLE_FAILED_INIT;
++
++static void init_curl(void)
++{
++    curl_global_status = curl_global_init(CURL_GLOBAL_DEFAULT);
++}
++
++static void secure_zero(void *ptr, size_t length)
++{
++    volatile unsigned char *p = (volatile unsigned char *)ptr;
++    while (length--)
++        *p++ = 0;
++}
++
++static void copy_string(char *destination, size_t capacity, const char *source)
++{
++    size_t length;
++    if (capacity == 0)
++        return;
++    if (!source)
++        source = "";
++    length = strlen(source);
++    if (length >= capacity)
++        length = capacity - 1;
++    memcpy(destination, source, length);
++    destination[length] = '\0';
++}
++
++static void set_error(webdav_range_state *state, int code, const char *format, ...)
++{
++    va_list args;
++    state->error_code = code;
++    va_start(args, format);
++    vsnprintf(state->error_message, sizeof(state->error_message), format, args);
++    va_end(args);
++}
++
++static void clear_error(webdav_range_state *state)
++{
++    state->error_code = MUPDF_WEBDAV_ERROR_NONE;
++    state->error_message[0] = '\0';
++}
++
++static int is_strong_etag(const char *etag)
++{
++    return etag && etag[0] == '"' && strlen(etag) >= 2 && etag[strlen(etag) - 1] == '"';
++}
++
++static int url_is_valid(const char *url, int *is_https)
++{
++    const char *authority;
++    const char *authority_end;
++    if (!url)
++        return 0;
++    if (strncasecmp(url, "https://", 8) == 0) {
++        authority = url + 8;
++        *is_https = 1;
++    } else if (strncasecmp(url, "http://", 7) == 0) {
++        authority = url + 7;
++        *is_https = 0;
++    } else {
++        return 0;
++    }
++    authority_end = authority + strcspn(authority, "/?#");
++    if (authority == authority_end || memchr(authority, '@', (size_t)(authority_end - authority)))
++        return 0;
++    return 1;
++}
++
++static int header_value_is_safe(const char *value)
++{
++    return !value || strpbrk(value, "\r\n") == NULL;
++}
++
++static void response_reset(webdav_range_state *state)
++{
++    state->response_content_range[0] = '\0';
++    state->response_etag[0] = '\0';
++    state->response_last_modified[0] = '\0';
++    state->response_header_too_long = 0;
++}
++
++static void store_header(webdav_range_state *state, char *destination, size_t capacity,
++                         const char *start, const char *end)
++{
++    size_t length;
++    while (start < end && isspace((unsigned char)*start))
++        start++;
++    while (end > start && isspace((unsigned char)end[-1]))
++        end--;
++    length = (size_t)(end - start);
++    if (length >= capacity) {
++        state->response_header_too_long = 1;
++        destination[0] = '\0';
++        return;
++    }
++    memcpy(destination, start, length);
++    destination[length] = '\0';
++}
++
++static size_t header_callback(char *buffer, size_t size, size_t count, void *userdata)
++{
++    webdav_range_state *state = (webdav_range_state *)userdata;
++    size_t length = size * count;
++    const char *colon;
++    const char *end = buffer + length;
++    if (length >= 5 && strncasecmp(buffer, "HTTP/", 5) == 0) {
++        response_reset(state);
++        return length;
++    }
++    colon = memchr(buffer, ':', length);
++    if (!colon)
++        return length;
++    if ((size_t)(colon - buffer) == 13 && strncasecmp(buffer, "Content-Range", 13) == 0)
++        store_header(state, state->response_content_range, sizeof(state->response_content_range), colon + 1, end);
++    else if ((size_t)(colon - buffer) == 4 && strncasecmp(buffer, "ETag", 4) == 0)
++        store_header(state, state->response_etag, sizeof(state->response_etag), colon + 1, end);
++    else if ((size_t)(colon - buffer) == 13 && strncasecmp(buffer, "Last-Modified", 13) == 0)
++        store_header(state, state->response_last_modified, sizeof(state->response_last_modified), colon + 1, end);
++    return length;
++}
++
++static int transfer_limit_exceeded(webdav_range_state *state, size_t incoming)
++{
++    uint64_t after;
++    if (!state->strict_mode)
++        return 0;
++    after = state->bytes_received + incoming;
++    if (state->opening_phase && state->opening_transfer_limit > 0 && after > state->opening_transfer_limit) {
++        state->operation_limit_hits++;
++        set_error(state, MUPDF_WEBDAV_ERROR_LIMIT,
++                  "remote stream: opening transfer limit exceeded; this archive cannot be efficiently random-accessed");
++        return 1;
++    }
++    if (state->operation_active && state->operation_transfer_limit > 0 &&
++            after - state->operation_start_bytes > state->operation_transfer_limit) {
++        state->operation_limit_hits++;
++        set_error(state, MUPDF_WEBDAV_ERROR_LIMIT,
++                  "remote stream: page transfer limit exceeded; this CBR is probably solid or otherwise not efficiently seekable");
++        return 1;
++    }
++    return 0;
++}
++
++static size_t write_callback(char *buffer, size_t size, size_t count, void *userdata)
++{
++    write_target *target = (write_target *)userdata;
++    size_t length = size * count;
++    if (length == 0)
++        return 0;
++    if (transfer_limit_exceeded(target->state, length)) {
++        /* libcurl has already delivered this chunk to us even though strict
++         * mode rejects it, so include it in diagnostic network totals. */
++        target->state->bytes_received += length;
++        return 0;
++    }
++    target->state->bytes_received += length;
++    if (length > target->capacity - target->length) {
++        set_error(target->state, MUPDF_WEBDAV_ERROR_RESPONSE,
++                  "remote stream: server returned more data than requested");
++        return 0;
++    }
++    memcpy(target->data + target->length, buffer, length);
++    target->length += length;
++    return length;
++}
++
++static int parse_content_range(const char *value, int64_t *start, int64_t *end, int64_t *total)
++{
++    char trailing;
++    return value && sscanf(value, "bytes %" SCNd64 "-%" SCNd64 "/%" SCNd64 " %c",
++                           start, end, total, &trailing) == 3;
++}
++
++static int curl_error_is_tls(CURLcode code)
++{
++    return code == CURLE_PEER_FAILED_VERIFICATION || code == CURLE_SSL_CONNECT_ERROR ||
++           code == CURLE_SSL_CERTPROBLEM || code == CURLE_SSL_CACERT_BADFILE ||
++           code == CURLE_USE_SSL_FAILED;
++}
++
++static int curl_error_is_retryable(CURLcode code)
++{
++    return code == CURLE_COULDNT_CONNECT || code == CURLE_COULDNT_RESOLVE_HOST ||
++           code == CURLE_RECV_ERROR || code == CURLE_SEND_ERROR ||
++           code == CURLE_GOT_NOTHING || code == CURLE_PARTIAL_FILE ||
++           code == CURLE_OPERATION_TIMEDOUT;
++}
++
++static int configure_curl(webdav_range_state *state)
++{
++#define SETOPT(option, value) do { if (curl_easy_setopt(state->curl, option, value) != CURLE_OK) return 0; } while (0)
++    SETOPT(CURLOPT_URL, state->url);
++    SETOPT(CURLOPT_NOSIGNAL, 1L);
++    SETOPT(CURLOPT_FOLLOWLOCATION, 1L);
++    SETOPT(CURLOPT_MAXREDIRS, 5L);
++    SETOPT(CURLOPT_UNRESTRICTED_AUTH, 0L);
++    SETOPT(CURLOPT_PROTOCOLS_STR, "http,https");
++    SETOPT(CURLOPT_REDIR_PROTOCOLS_STR, state->initial_url_is_https ? "https" : "http,https");
++    SETOPT(CURLOPT_SSL_VERIFYPEER, 1L);
++    SETOPT(CURLOPT_SSL_VERIFYHOST, 2L);
++    SETOPT(CURLOPT_CONNECTTIMEOUT_MS, state->connect_timeout_ms);
++    SETOPT(CURLOPT_TIMEOUT_MS, state->transfer_timeout_ms);
++    SETOPT(CURLOPT_LOW_SPEED_LIMIT, 1L);
++    SETOPT(CURLOPT_LOW_SPEED_TIME, 30L);
++    SETOPT(CURLOPT_TCP_KEEPALIVE, 1L);
++    SETOPT(CURLOPT_HTTPAUTH, (long)CURLAUTH_ANY);
++    SETOPT(CURLOPT_USERNAME, state->username);
++    SETOPT(CURLOPT_PASSWORD, state->password);
++    SETOPT(CURLOPT_HEADERFUNCTION, header_callback);
++    SETOPT(CURLOPT_HEADERDATA, state);
++    return 1;
++#undef SETOPT
++}
++
++static void clear_blocks(fz_context *ctx, webdav_range_state *state)
++{
++    range_block *block = state->newest;
++    while (block) {
++        range_block *next = block->older;
++        if (block->data) {
++            secure_zero(block->data, block->length);
++            fz_free(ctx, block->data);
++        }
++        fz_free(ctx, block);
++        block = next;
++    }
++    state->newest = NULL;
++    state->oldest = NULL;
++    state->cached_bytes = 0;
++}
++
++static void drop_state(fz_context *ctx, void *opaque)
++{
++    webdav_range_state *state = (webdav_range_state *)opaque;
++    if (!state)
++        return;
++    clear_blocks(ctx, state);
++    if (state->curl) {
++        curl_easy_setopt(state->curl, CURLOPT_USERNAME, "");
++        curl_easy_setopt(state->curl, CURLOPT_PASSWORD, "");
++        curl_easy_cleanup(state->curl);
++    }
++    if (state->password) {
++        secure_zero(state->password, strlen(state->password));
++        fz_free(ctx, state->password);
++    }
++    if (state->username) {
++        secure_zero(state->username, strlen(state->username));
++        fz_free(ctx, state->username);
++    }
++    if (state->url) {
++        secure_zero(state->url, strlen(state->url));
++        fz_free(ctx, state->url);
++    }
++    if (state->etag) {
++        secure_zero(state->etag, strlen(state->etag));
++        fz_free(ctx, state->etag);
++    }
++    if (state->last_modified) {
++        secure_zero(state->last_modified, strlen(state->last_modified));
++        fz_free(ctx, state->last_modified);
++    }
++    secure_zero(state->error_message, sizeof(state->error_message));
++    fz_free(ctx, state);
++}
++
++static webdav_range_state *new_state(fz_context *ctx, const mupdf_webdav_stream_options *options,
++                                     int allow_unknown_length)
++{
++    webdav_range_state *state = NULL;
++    if (!options || !options->url)
++        fz_throw(ctx, FZ_ERROR_ARGUMENT, "remote stream: URL is required");
++    if (!allow_unknown_length && options->content_length <= 0)
++        fz_throw(ctx, FZ_ERROR_ARGUMENT, "remote stream: a positive content length is required");
++    if (options->block_size == 0 || options->cache_limit < options->block_size)
++        fz_throw(ctx, FZ_ERROR_ARGUMENT, "remote stream: invalid block cache configuration");
++
++    fz_var(state);
++    fz_try(ctx) {
++        state = fz_calloc(ctx, 1, sizeof(*state));
++        if (!url_is_valid(options->url, &state->initial_url_is_https))
++            fz_throw(ctx, FZ_ERROR_ARGUMENT,
++                     "remote stream: URL must be HTTP(S) and must not contain user-info");
++        state->url = fz_strdup(ctx, options->url);
++        state->username = fz_strdup(ctx, options->username ? options->username : "");
++        state->password = fz_strdup(ctx, options->password ? options->password : "");
++        state->etag = fz_strdup(ctx, options->etag ? options->etag : "");
++        state->last_modified = fz_strdup(ctx, options->last_modified ? options->last_modified : "");
++        if (strlen(state->etag) >= MUPDF_WEBDAV_ETAG_MAX ||
++                strlen(state->last_modified) >= MUPDF_WEBDAV_LAST_MODIFIED_MAX)
++            fz_throw(ctx, FZ_ERROR_ARGUMENT, "remote stream: validator header is too long");
++        if (!header_value_is_safe(state->etag) || !header_value_is_safe(state->last_modified))
++            fz_throw(ctx, FZ_ERROR_ARGUMENT, "remote stream: invalid validator header");
++        state->strong_etag = is_strong_etag(state->etag);
++        state->content_length = options->content_length;
++        state->block_size = options->block_size;
++        state->cache_limit = options->cache_limit;
++        state->opening_transfer_limit = options->opening_transfer_limit;
++        state->operation_transfer_limit = options->operation_transfer_limit;
++        state->strict_mode = options->strict_mode;
++        state->opening_phase = 1;
++        state->last_miss_index = -2;
++        state->connect_timeout_ms = options->connect_timeout_ms > 0 ? options->connect_timeout_ms : 15000;
++        state->transfer_timeout_ms = options->transfer_timeout_ms > 0 ? options->transfer_timeout_ms : 60000;
++
++        pthread_once(&curl_once, init_curl);
++        if (curl_global_status != CURLE_OK)
++            fz_throw(ctx, FZ_ERROR_SYSTEM, "remote stream: libcurl initialization failed");
++        state->curl = curl_easy_init();
++        if (!state->curl || !configure_curl(state))
++            fz_throw(ctx, FZ_ERROR_SYSTEM, "remote stream: libcurl setup failed");
++    }
++    fz_catch(ctx) {
++        drop_state(ctx, state);
++        fz_rethrow(ctx);
++    }
++    return state;
++}
++
++static int append_header(struct curl_slist **headers, const char *value)
++{
++    struct curl_slist *appended = curl_slist_append(*headers, value);
++    if (!appended)
++        return 0;
++    *headers = appended;
++    return 1;
++}
++
++static int perform_range_request(webdav_range_state *state, int64_t requested_start,
++                                 int64_t requested_end, unsigned char *data, size_t capacity,
++                                 size_t *received)
++{
++    char range_header[96];
++    char if_range_header[MUPDF_WEBDAV_ETAG_MAX + 32];
++    struct curl_slist *headers = NULL;
++    write_target target;
++    CURLcode status = CURLE_OK;
++    int attempt;
++    int64_t actual_start = -1, actual_end = -1, actual_total = -1;
++
++    /* MuPDF's archive and comic handlers may catch a stream exception and
++     * continue. Keep the first failure sticky for the current open/page
++     * operation so a later read cannot erase its actionable diagnostic.
++     * begin_operation() explicitly clears it when the user retries a page. */
++    if (state->error_code != MUPDF_WEBDAV_ERROR_NONE)
++        return 0;
++
++    snprintf(range_header, sizeof(range_header), "Range: bytes=%" PRId64 "-%" PRId64,
++             requested_start, requested_end);
++    if (!append_header(&headers, range_header) ||
++            !append_header(&headers, "Accept-Encoding: identity") ||
++            !append_header(&headers, "Cache-Control: no-transform"))
++        goto header_allocation_failed;
++    if (state->strong_etag && state->etag[0]) {
++        snprintf(if_range_header, sizeof(if_range_header), "If-Range: %s", state->etag);
++        if (!append_header(&headers, if_range_header))
++            goto header_allocation_failed;
++    } else if (state->last_modified[0]) {
++        snprintf(if_range_header, sizeof(if_range_header), "If-Range: %s", state->last_modified);
++        if (!append_header(&headers, if_range_header))
++            goto header_allocation_failed;
++    }
++
++    target.state = state;
++    target.data = data;
++    target.capacity = capacity;
++    target.length = 0;
++    for (attempt = 0; attempt < 2; attempt++) {
++        response_reset(state);
++        target.length = 0;
++        state->request_count++;
++        curl_easy_setopt(state->curl, CURLOPT_HTTPHEADER, headers);
++        curl_easy_setopt(state->curl, CURLOPT_WRITEFUNCTION, write_callback);
++        curl_easy_setopt(state->curl, CURLOPT_WRITEDATA, &target);
++        curl_easy_setopt(state->curl, CURLOPT_FRESH_CONNECT, attempt == 0 ? 0L : 1L);
++        status = curl_easy_perform(state->curl);
++        curl_easy_getinfo(state->curl, CURLINFO_RESPONSE_CODE, &state->last_http_status);
++        if (status == CURLE_OK || state->error_code != MUPDF_WEBDAV_ERROR_NONE ||
++                !curl_error_is_retryable(status) || attempt == 1)
++            break;
++        state->retry_count++;
++    }
++    curl_easy_setopt(state->curl, CURLOPT_HTTPHEADER, NULL);
++    curl_slist_free_all(headers);
++
++    /* A server that ignores Range may overrun our deliberately small response
++     * buffer, causing CURLE_WRITE_ERROR. Classify the HTTP response first so a
++     * bounded probe still reports the useful "no range"/"changed" error. */
++    if (state->last_http_status == 401 || state->last_http_status == 403) {
++        set_error(state, MUPDF_WEBDAV_ERROR_AUTH, "remote stream: authentication failed");
++        return 0;
++    }
++    if (state->last_http_status == 404 || state->last_http_status == 410) {
++        set_error(state, MUPDF_WEBDAV_ERROR_UNAVAILABLE, "remote stream: remote file is unavailable");
++        return 0;
++    }
++    if (state->last_http_status != 0 && state->last_http_status != 206) {
++        if (state->last_http_status == 200 && (state->etag[0] || state->last_modified[0]))
++            set_error(state, MUPDF_WEBDAV_ERROR_CHANGED, "remote stream: remote file changed");
++        else if (state->last_http_status == 200)
++            set_error(state, MUPDF_WEBDAV_ERROR_NO_RANGE, "remote stream: server ignored the byte range request");
++        else
++            set_error(state, MUPDF_WEBDAV_ERROR_RESPONSE,
++                      "remote stream: server returned HTTP %ld instead of 206", state->last_http_status);
++        return 0;
++    }
++    if (state->error_code != MUPDF_WEBDAV_ERROR_NONE)
++        return 0;
++    if (status != CURLE_OK) {
++        if (status == CURLE_OPERATION_TIMEDOUT)
++            set_error(state, MUPDF_WEBDAV_ERROR_TIMEOUT, "remote stream: request timed out");
++        else if (status == CURLE_PARTIAL_FILE && state->last_http_status == 206)
++            set_error(state, MUPDF_WEBDAV_ERROR_RESPONSE, "remote stream: truncated byte range response");
++        else if (curl_error_is_tls(status))
++            set_error(state, MUPDF_WEBDAV_ERROR_TLS, "remote stream: TLS verification or handshake failed");
++        else
++            set_error(state, MUPDF_WEBDAV_ERROR_NETWORK, "remote stream: network request failed (%d)", (int)status);
++        return 0;
++    }
++    if (state->last_http_status != 206) {
++        set_error(state, MUPDF_WEBDAV_ERROR_RESPONSE,
++                  "remote stream: server returned HTTP %ld instead of 206", state->last_http_status);
++        return 0;
++    }
++    if (state->response_header_too_long ||
++            !parse_content_range(state->response_content_range, &actual_start, &actual_end, &actual_total)) {
++        set_error(state, MUPDF_WEBDAV_ERROR_RESPONSE, "remote stream: invalid or missing Content-Range");
++        return 0;
++    }
++    if (actual_start != requested_start || actual_end != requested_end || actual_total <= 0) {
++        set_error(state, MUPDF_WEBDAV_ERROR_RESPONSE, "remote stream: Content-Range does not match the request");
++        return 0;
++    }
++    if (state->content_length > 0 && actual_total != state->content_length) {
++        set_error(state, MUPDF_WEBDAV_ERROR_CHANGED, "remote stream: remote file size changed");
++        return 0;
++    }
++    if (state->content_length <= 0)
++        state->content_length = actual_total;
++    /* Weak (or malformed) ETags are not valid If-Range validators. They may
++     * also come from a PROPFIND endpoint in front of a different GET/CDN
++     * representation. Only require an ETag when it is genuinely strong;
++     * otherwise validate Last-Modified and the Content-Range total. */
++    if (state->strong_etag) {
++        if (!state->response_etag[0]) {
++            set_error(state, MUPDF_WEBDAV_ERROR_CHANGED,
++                      "remote stream: server omitted the expected ETag");
++            return 0;
++        }
++        if (strcmp(state->etag, state->response_etag) != 0) {
++            set_error(state, MUPDF_WEBDAV_ERROR_CHANGED, "remote stream: remote file ETag changed");
++            return 0;
++        }
++    }
++    if (!state->strong_etag && state->last_modified[0]) {
++        if (!state->response_last_modified[0]) {
++            set_error(state, MUPDF_WEBDAV_ERROR_CHANGED,
++                      "remote stream: server omitted the expected Last-Modified value");
++            return 0;
++        }
++        if (strcmp(state->last_modified, state->response_last_modified) != 0) {
++            set_error(state, MUPDF_WEBDAV_ERROR_CHANGED,
++                      "remote stream: remote file Last-Modified value changed");
++            return 0;
++        }
++    }
++    if (target.length != (size_t)(requested_end - requested_start + 1)) {
++        set_error(state, MUPDF_WEBDAV_ERROR_RESPONSE, "remote stream: truncated byte range response");
++        return 0;
++    }
++    *received = target.length;
++    return 1;
++
++header_allocation_failed:
++    curl_slist_free_all(headers);
++    set_error(state, MUPDF_WEBDAV_ERROR_NETWORK,
++              "remote stream: cannot allocate HTTP headers");
++    return 0;
++}
++
++static range_block *find_block(webdav_range_state *state, int64_t index)
++{
++    range_block *block;
++    for (block = state->newest; block; block = block->older)
++        if (block->index == index)
++            return block;
++    return NULL;
++}
++
++static void unlink_block(webdav_range_state *state, range_block *block)
++{
++    if (block->newer)
++        block->newer->older = block->older;
++    else
++        state->newest = block->older;
++    if (block->older)
++        block->older->newer = block->newer;
++    else
++        state->oldest = block->newer;
++    block->newer = NULL;
++    block->older = NULL;
++}
++
++static void make_newest(webdav_range_state *state, range_block *block)
++{
++    if (state->newest == block)
++        return;
++    if (block->newer || block->older || state->oldest == block)
++        unlink_block(state, block);
++    block->older = state->newest;
++    if (state->newest)
++        state->newest->newer = block;
++    else
++        state->oldest = block;
++    state->newest = block;
++}
++
++static void evict_oldest(fz_context *ctx, webdav_range_state *state)
++{
++    range_block *block = state->oldest;
++    if (!block)
++        return;
++    unlink_block(state, block);
++    state->cached_bytes -= block->length;
++    secure_zero(block->data, block->length);
++    fz_free(ctx, block->data);
++    fz_free(ctx, block);
++}
++
++static range_block *fetch_block(fz_context *ctx, webdav_range_state *state, int64_t index)
++{
++    range_block *block = NULL;
++    int64_t start;
++    int64_t end;
++    size_t wanted;
++    size_t received = 0;
++
++    if (index < 0 || index > INT64_MAX / (int64_t)state->block_size) {
++        set_error(state, MUPDF_WEBDAV_ERROR_ARGUMENT, "remote stream: invalid block index");
++        return NULL;
++    }
++    start = index * (int64_t)state->block_size;
++    if (start >= state->content_length)
++        return NULL;
++    end = start + (int64_t)state->block_size - 1;
++    if (end < start || end >= state->content_length)
++        end = state->content_length - 1;
++    wanted = (size_t)(end - start + 1);
++
++    fz_var(block);
++    fz_try(ctx) {
++        block = fz_calloc(ctx, 1, sizeof(*block));
++        /* Evict before allocating the incoming block so the block buffers
++         * never transiently exceed the configured RAM ceiling. */
++        while (state->cached_bytes + wanted > state->cache_limit)
++            evict_oldest(ctx, state);
++        block->data = fz_malloc(ctx, wanted);
++        if (!perform_range_request(state, start, end, block->data, wanted, &received))
++            break;
++        block->index = index;
++        block->length = received;
++        make_newest(state, block);
++        state->cached_bytes += block->length;
++        if (state->cached_bytes > state->peak_cached_bytes)
++            state->peak_cached_bytes = state->cached_bytes;
++    }
++    fz_catch(ctx) {
++        if (block) {
++            if (block->data)
++                fz_free(ctx, block->data);
++            fz_free(ctx, block);
++        }
++        fz_rethrow(ctx);
++    }
++    if (state->error_code != MUPDF_WEBDAV_ERROR_NONE) {
++        if (block) {
++            if (block->data) {
++                secure_zero(block->data, wanted);
++                fz_free(ctx, block->data);
++            }
++            fz_free(ctx, block);
++        }
++        clear_blocks(ctx, state);
++        return NULL;
++    }
++    return block;
++}
++
++static int next_range(fz_context *ctx, fz_stream *stream, size_t max)
++{
++    webdav_range_state *state = (webdav_range_state *)stream->state;
++    int64_t position = stream->pos;
++    int64_t index;
++    int64_t block_start;
++    size_t offset;
++    range_block *block;
++    (void)max;
++
++    if (position >= state->content_length)
++        return EOF;
++    if (position < 0)
++        fz_throw(ctx, FZ_ERROR_ARGUMENT, "remote stream: negative read position");
++    index = position / (int64_t)state->block_size;
++    block = find_block(state, index);
++    if (block) {
++        state->cache_hits++;
++        make_newest(state, block);
++    } else {
++        state->cache_misses++;
++        if (index == state->last_miss_index + 1)
++            state->sequential_run += state->block_size;
++        else
++            state->sequential_run = state->block_size;
++        state->last_miss_index = index;
++        if (state->sequential_run > state->longest_sequential_run)
++            state->longest_sequential_run = state->sequential_run;
++        block = fetch_block(ctx, state, index);
++        if (!block) {
++            if (state->error_code != MUPDF_WEBDAV_ERROR_NONE) {
++                /* fetch_block clears the LRU after an error; do not leave
++                 * MuPDF pointing at the just-evicted block on a later retry. */
++                stream->rp = state->empty;
++                stream->wp = state->empty;
++                fz_throw(ctx, FZ_ERROR_SYSTEM, "%s", state->error_message);
++            }
++            return EOF;
++        }
++    }
++    block_start = index * (int64_t)state->block_size;
++    offset = (size_t)(position - block_start);
++    if (offset >= block->length)
++        fz_throw(ctx, FZ_ERROR_FORMAT, "remote stream: cached block is shorter than expected");
++    stream->rp = block->data + offset;
++    stream->wp = block->data + block->length;
++    stream->pos = block_start + (int64_t)block->length;
++    return *stream->rp++;
++}
++
++static void seek_range(fz_context *ctx, fz_stream *stream, int64_t offset, int whence)
++{
++    webdav_range_state *state = (webdav_range_state *)stream->state;
++    int64_t position;
++    if (whence == SEEK_SET)
++        position = offset;
++    else if (whence == SEEK_END) {
++        if ((offset > 0 && state->content_length > INT64_MAX - offset) ||
++                (offset < 0 && state->content_length < INT64_MIN - offset))
++            fz_throw(ctx, FZ_ERROR_ARGUMENT, "remote stream: seek overflow");
++        position = state->content_length + offset;
++    } else {
++        fz_throw(ctx, FZ_ERROR_ARGUMENT, "remote stream: unsupported seek origin");
++    }
++    if (position < 0)
++        fz_throw(ctx, FZ_ERROR_ARGUMENT, "remote stream: negative seek position");
++    stream->pos = position;
++    stream->rp = state->empty;
++    stream->wp = state->empty;
++}
++
++static webdav_range_state *state_from_stream(fz_stream *stream)
++{
++    if (!stream || stream->next != next_range)
++        return NULL;
++    return (webdav_range_state *)stream->state;
++}
++
++fz_stream *webdav_range_stream_open(fz_context *ctx, const mupdf_webdav_stream_options *options)
++{
++    webdav_range_state *state = new_state(ctx, options, 0);
++    fz_stream *stream = NULL;
++    fz_var(stream);
++    fz_try(ctx) {
++        stream = fz_new_stream(ctx, state, next_range, drop_state);
++        state = NULL;
++        stream->seek = seek_range;
++        stream->rp = ((webdav_range_state *)stream->state)->empty;
++        stream->wp = ((webdav_range_state *)stream->state)->empty;
++    }
++    fz_catch(ctx) {
++        drop_state(ctx, state);
++        fz_rethrow(ctx);
++    }
++    return stream;
++}
++
++int webdav_range_stream_probe(fz_context *ctx, const mupdf_webdav_stream_options *options,
++                              mupdf_webdav_probe_result *result)
++{
++    webdav_range_state *state = NULL;
++    unsigned char byte = 0;
++    size_t received = 0;
++    int ok = 0;
++    char error[MUPDF_WEBDAV_ERROR_MAX];
++    int error_code;
++
++    if (!result)
++        fz_throw(ctx, FZ_ERROR_ARGUMENT, "remote stream: probe result is required");
++    memset(result, 0, sizeof(*result));
++    state = new_state(ctx, options, 1);
++    if (perform_range_request(state, 0, 0, &byte, 1, &received)) {
++        result->content_length = state->content_length;
++        result->strong_etag = is_strong_etag(state->response_etag);
++        result->http_status = state->last_http_status;
++        copy_string(result->etag, sizeof(result->etag), state->response_etag);
++        copy_string(result->last_modified, sizeof(result->last_modified), state->response_last_modified);
++        ok = 1;
++    } else {
++        error_code = state->error_code;
++        copy_string(error, sizeof(error), state->error_message);
++        result->error_code = error_code;
++        result->http_status = state->last_http_status;
++        copy_string(result->error_message, sizeof(result->error_message), error);
++    }
++    drop_state(ctx, state);
++    if (!ok)
++        fz_throw(ctx, FZ_ERROR_SYSTEM, "%s", result->error_message);
++    return 1;
++}
++
++void webdav_range_stream_finish_open(fz_stream *stream)
++{
++    webdav_range_state *state = state_from_stream(stream);
++    if (!state)
++        return;
++    state->opening_phase = 0;
++    state->opening_bytes = state->bytes_received;
++}
++
++void webdav_range_stream_begin_operation(fz_stream *stream)
++{
++    webdav_range_state *state = state_from_stream(stream);
++    if (!state)
++        return;
++    clear_error(state);
++    state->operation_active = 1;
++    state->operation_start_bytes = state->bytes_received;
++}
++
++void webdav_range_stream_end_operation(fz_stream *stream)
++{
++    webdav_range_state *state = state_from_stream(stream);
++    if (state)
++        state->operation_active = 0;
++}
++
++void webdav_range_stream_clear_cache(fz_context *ctx, fz_stream *stream)
++{
++    webdav_range_state *state = state_from_stream(stream);
++    if (state) {
++        int64_t position = stream->pos - (int64_t)(stream->wp - stream->rp);
++        stream->rp = state->empty;
++        stream->wp = state->empty;
++        stream->pos = position;
++        clear_blocks(ctx, state);
++    }
++}
++
++int webdav_range_stream_get_stats(fz_stream *stream, mupdf_webdav_stream_stats *stats)
++{
++    webdav_range_state *state = state_from_stream(stream);
++    if (!state || !stats)
++        return 0;
++    memset(stats, 0, sizeof(*stats));
++    stats->content_length = state->content_length;
++    stats->request_count = state->request_count;
++    stats->retry_count = state->retry_count;
++    stats->bytes_received = state->bytes_received;
++    stats->cache_hits = state->cache_hits;
++    stats->cache_misses = state->cache_misses;
++    stats->cached_bytes = state->cached_bytes;
++    stats->peak_cached_bytes = state->peak_cached_bytes;
++    stats->opening_bytes = state->opening_bytes;
++    stats->operation_limit_hits = state->operation_limit_hits;
++    stats->longest_sequential_run = state->longest_sequential_run;
++    stats->last_http_status = state->last_http_status;
++    stats->error_code = state->error_code;
++    return 1;
++}
++
++const char *webdav_range_stream_last_error(fz_stream *stream)
++{
++    webdav_range_state *state = state_from_stream(stream);
++    return state ? state->error_message : "";
++}
+diff --git a/webdav-range-stream.h b/webdav-range-stream.h
+new file mode 100644
+index 00000000..9b524b47
+--- /dev/null
++++ b/webdav-range-stream.h
+@@ -0,0 +1,83 @@
++#ifndef KOREADER_WEBDAV_RANGE_STREAM_H
++#define KOREADER_WEBDAV_RANGE_STREAM_H
++
++#include <mupdf/fitz.h>
++
++#include <stddef.h>
++#include <stdint.h>
++
++#define MUPDF_WEBDAV_ETAG_MAX 512
++#define MUPDF_WEBDAV_LAST_MODIFIED_MAX 128
++#define MUPDF_WEBDAV_ERROR_MAX 256
++
++enum mupdf_webdav_error {
++    MUPDF_WEBDAV_ERROR_NONE = 0,
++    MUPDF_WEBDAV_ERROR_ARGUMENT = 1,
++    MUPDF_WEBDAV_ERROR_NO_RANGE = 2,
++    MUPDF_WEBDAV_ERROR_AUTH = 3,
++    MUPDF_WEBDAV_ERROR_CHANGED = 4,
++    MUPDF_WEBDAV_ERROR_TLS = 5,
++    MUPDF_WEBDAV_ERROR_TIMEOUT = 6,
++    MUPDF_WEBDAV_ERROR_NETWORK = 7,
++    MUPDF_WEBDAV_ERROR_RESPONSE = 8,
++    MUPDF_WEBDAV_ERROR_LIMIT = 9,
++    MUPDF_WEBDAV_ERROR_UNAVAILABLE = 10,
++};
++
++typedef struct mupdf_webdav_stream_options {
++    const char *url;
++    const char *username;
++    const char *password;
++    const char *etag;
++    const char *last_modified;
++    int64_t content_length;
++    size_t block_size;
++    size_t cache_limit;
++    uint64_t opening_transfer_limit;
++    uint64_t operation_transfer_limit;
++    long connect_timeout_ms;
++    long transfer_timeout_ms;
++    int strict_mode;
++} mupdf_webdav_stream_options;
++
++typedef struct mupdf_webdav_probe_result {
++    int64_t content_length;
++    int strong_etag;
++    int error_code;
++    long http_status;
++    char etag[MUPDF_WEBDAV_ETAG_MAX];
++    char last_modified[MUPDF_WEBDAV_LAST_MODIFIED_MAX];
++    char error_message[MUPDF_WEBDAV_ERROR_MAX];
++} mupdf_webdav_probe_result;
++
++typedef struct mupdf_webdav_stream_stats {
++    int64_t content_length;
++    uint64_t request_count;
++    uint64_t retry_count;
++    uint64_t bytes_received;
++    uint64_t cache_hits;
++    uint64_t cache_misses;
++    uint64_t cached_bytes;
++    uint64_t peak_cached_bytes;
++    uint64_t opening_bytes;
++    uint64_t operation_limit_hits;
++    uint64_t longest_sequential_run;
++    long last_http_status;
++    int error_code;
++} mupdf_webdav_stream_stats;
++
++/* These helpers may throw MuPDF exceptions and must only be called inside a
++ * MuPDF exception wrapper. */
++fz_stream *webdav_range_stream_open(fz_context *ctx, const mupdf_webdav_stream_options *options);
++int webdav_range_stream_probe(fz_context *ctx, const mupdf_webdav_stream_options *options,
++                              mupdf_webdav_probe_result *result);
++
++/* The remaining helpers never throw. */
++void webdav_range_stream_finish_open(fz_stream *stream);
++void webdav_range_stream_begin_operation(fz_stream *stream);
++void webdav_range_stream_end_operation(fz_stream *stream);
++void webdav_range_stream_clear_cache(fz_context *ctx, fz_stream *stream);
++int webdav_range_stream_get_stats(fz_stream *stream, mupdf_webdav_stream_stats *stats);
++const char *webdav_range_stream_last_error(fz_stream *stream);
++
++#endif
+diff --git a/wrap-mupdf.c b/wrap-mupdf.c
+index 8d7ad7cb..9660d1ff 100644
+--- a/wrap-mupdf.c
++++ b/wrap-mupdf.c
+@@ -158,6 +158,30 @@ char* mupdf_error_message(fz_context *ctx) {
+     return ctx->error.message;
+ }
+
++void mupdf_webdav_stream_finish_open(fz_stream *stream) {
++    webdav_range_stream_finish_open(stream);
++}
++
++void mupdf_webdav_stream_begin_operation(fz_stream *stream) {
++    webdav_range_stream_begin_operation(stream);
++}
++
++void mupdf_webdav_stream_end_operation(fz_stream *stream) {
++    webdav_range_stream_end_operation(stream);
++}
++
++void mupdf_webdav_stream_clear_cache(fz_context *ctx, fz_stream *stream) {
++    webdav_range_stream_clear_cache(ctx, stream);
++}
++
++int mupdf_webdav_stream_get_stats(fz_stream *stream, mupdf_webdav_stream_stats *stats) {
++    return webdav_range_stream_get_stats(stream, stats);
++}
++
++const char *mupdf_webdav_stream_last_error(fz_stream *stream) {
++    return webdav_range_stream_last_error(stream);
++}
++
+ fz_matrix *mupdf_fz_scale(fz_matrix *m, float sx, float sy) {
+     *m = fz_scale(sx, sy);
+     return m;
+diff --git a/wrap-mupdf.h b/wrap-mupdf.h
+index a83b9cf8..ffa8fbbf 100644
+--- a/wrap-mupdf.h
++++ b/wrap-mupdf.h
+@@ -22,6 +22,7 @@
+ #include <math.h>
+ #include <mupdf/fitz.h>
+ #include <mupdf/pdf.h>
++#include "webdav-range-stream.h"
+
+ // Symbol visibility
+ #define DLL_PUBLIC __attribute__((visibility("default")))
+@@ -32,6 +33,13 @@ DLL_PUBLIC int mupdf_get_cache_size();
+ DLL_PUBLIC int mupdf_error_code(fz_context *ctx);
+ DLL_PUBLIC char* mupdf_error_message(fz_context *ctx);
+
++DLL_PUBLIC void mupdf_webdav_stream_finish_open(fz_stream *stream);
++DLL_PUBLIC void mupdf_webdav_stream_begin_operation(fz_stream *stream);
++DLL_PUBLIC void mupdf_webdav_stream_end_operation(fz_stream *stream);
++DLL_PUBLIC void mupdf_webdav_stream_clear_cache(fz_context *ctx, fz_stream *stream);
++DLL_PUBLIC int mupdf_webdav_stream_get_stats(fz_stream *stream, mupdf_webdav_stream_stats *stats);
++DLL_PUBLIC const char *mupdf_webdav_stream_last_error(fz_stream *stream);
++
+ DLL_PUBLIC fz_matrix *mupdf_fz_scale(fz_matrix *m, float sx, float sy);
+ DLL_PUBLIC fz_matrix *mupdf_fz_translate(fz_matrix *m, float tx, float ty);
+ DLL_PUBLIC fz_matrix *mupdf_fz_pre_rotate(fz_matrix *m, float theta);
+@@ -78,6 +86,12 @@ MUPDF_WRAP(mupdf_open_document, fz_document*, NULL,
+ MUPDF_WRAP(mupdf_open_document_with_stream_and_dir, fz_document*, NULL,
+     ret = fz_open_document_with_stream_and_dir(ctx, magic, stream, archive),
+     const char *magic, fz_stream *stream, fz_archive *archive)
++MUPDF_WRAP(mupdf_new_webdav_range_stream, fz_stream*, NULL,
++    ret = webdav_range_stream_open(ctx, options),
++    const mupdf_webdav_stream_options *options)
++MUPDF_WRAP(mupdf_probe_webdav_range, int, 0,
++    ret = webdav_range_stream_probe(ctx, options, result),
++    const mupdf_webdav_stream_options *options, mupdf_webdav_probe_result *result)
+ MUPDF_WRAP(mupdf_open_memory, fz_stream*, NULL,
+     ret = fz_open_memory(ctx, data, len),
+     const unsigned char *data, size_t len)
+@@ -90,6 +104,8 @@ MUPDF_WRAP(mupdf_drop_archive, void*, NULL,
+ MUPDF_WRAP(mupdf_drop_stream, void*, NULL,
+     { fz_drop_stream(ctx, stm); ret = (void*) -1; },
+     fz_stream *stm)
++MUPDF_WRAP(mupdf_empty_store, void*, NULL,
++    { fz_empty_store(ctx); ret = (void*) -1; })
+ MUPDF_WRAP(mupdf_count_pages, int, -1,
+     ret = fz_count_pages(ctx, doc),
+     fz_document *doc)
+@@ -201,4 +217,3 @@ MUPDF_WRAP(mupdf_new_buffer_from_shared_data, fz_buffer*, NULL,
+ MUPDF_WRAP(mupdf_drop_buffer, void*, NULL,
+     { fz_drop_buffer(ctx, buf); ret = (void*) -1; },
+     fz_buffer *buf)
+-

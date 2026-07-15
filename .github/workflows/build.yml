@@ -1,226 +1,228 @@
-name: macos
+name: Kobo build and release
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+    tags:
+      - "stream.v*"
+  workflow_dispatch:
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
-on: [push, pull_request, workflow_dispatch]
+permissions:
+  contents: read
 
 defaults:
   run:
     shell: bash
 
+env:
+  BASE_REV: 0309968402ce4f695e12e0a200506037e75225a3
+  CI: "true"
+  CLICOLOR_FORCE: "1"
+
 jobs:
-
-  macos:
-
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - image: '15'
-            platform: 'x86-64'
-            xcode_version: '16.4'
-            deployment_target: '10.15'
-            jobs: 5
-          - image: '15'
-            platform: 'ARM64'
-            xcode_version: '16.4'
-            deployment_target: '11.0'
-            jobs: 4
-
-    name: "macOS ${{ matrix.image }} ${{ matrix.platform }} 🔨${{ matrix.xcode_version }} 🎯${{ matrix.deployment_target }}"
-
-    runs-on: "macos-${{ matrix.image }}${{ matrix.platform == 'x86-64' && '-intel' || '' }}"
-
+  test:
+    name: Streaming tests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    container:
+      image: koreader/koappimage:2.0.0-22.04@sha256:4416f7b137b1eda49eb486bbe00dd00a347f0f126a649bf75bf1edc8d4877828
     env:
-      # Bump first number to reset all caches.
-      CACHE_KEY: "1-macOS-${{ matrix.image }}-${{ matrix.platform }}-XC${{ matrix.xcode_version }}-DT${{ matrix.deployment_target }}"
-      CLICOLOR_FORCE: '1'
-      KODEBUG: ""
-      MACOSX_DEPLOYMENT_TARGET: ${{ matrix.deployment_target }}
-      MAKEFLAGS: OUTPUT_DIR=build PARALLEL_JOBS=${{ matrix.jobs }} INSTALL_DIR=install TARGET=macos
+      BASH_ENV: /home/ko/.bashrc
+      CCACHE_DIR: ${{ github.workspace }}/.ccache
 
     steps:
-
-      # Install dependencies. {{{
-
-      - name: XCode version
-        run: |
-          sudo xcode-select -s /Applications/Xcode_${{ matrix.xcode_version }}.app
-          xcodebuild -version
-          xcode-select -p
-
-      - name: Setup Python
-        uses: actions/setup-python@v6
+      - name: Check out source
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
         with:
-          python-version: '3.12'
-
-      - name: Install dependencies
-        run: |
-          set -x
-          python3 -m pip install --disable-pip-version-check meson ruamel.yaml
-          wget -O ninjatracing.zip https://github.com/cradleapps/ninjatracing/archive/084212eaf68f25c70579958a2ed67fb4ec2a9ca4.zip
-          unzip -j ninjatracing.zip '*/ninjatracing'
-          install -m755 ninjatracing /usr/local/bin/
-          rm ninjatracing*
-          # Install brew packages.
-          packages=(
-            autoconf
-            automake
-            bash
-            binutils
-            coreutils
-            findutils
-            libtool
-            make
-            nasm
-            ninja
-            pkg-config
-            util-linux
-          )
-          # Don't auto-update.
-          export HOMEBREW_NO_AUTO_UPDATE=1
-          # Don't upgrade already installed formulas.
-          export HOMEBREW_NO_INSTALL_UPGRADE=1
-          # Remove some installed packages to prevent brew
-          # from attempting (and failing) to upgrade them.
-          brew uninstall gradle maven
-          brew install --formula --overwrite --quiet "${packages[@]}"
-
-      - name: Update PATH
-        run: >
-          printf '%s\n'
-          "$(brew --prefix)/opt/findutils/libexec/gnubin"
-          "$(brew --prefix)/opt/make/libexec/gnubin"
-          "$(brew --prefix)/opt/util-linux/bin"
-          | tee "${GITHUB_PATH}"
-
-      # }}}
-
-      # Checkout / fetch. {{{
-
-      - name: Checkout
-        uses: actions/checkout@v6
-        with:
-          clean: false
           fetch-depth: 0
-          filter: tree:0
-          show-progress: false
+          persist-credentials: false
 
-      - name: Fetch
-        run: make fetchthirdparty
-
-      # }}}
-
-      - name: Generate cache key
-        run: make TARGET= cache-key
-
-      - name: Restore build directory
-        id: build-restore
-        uses: actions/cache/restore@v5
-        with:
-          path: build
-          key: ${{ env.CACHE_KEY }}-build-${{ hashFiles('cache-key') }}
-
-      # Restore / setup build cache. {{{
-
-      - name: Lookup or restore build cache
-        id: ccache-restore
-        uses: actions/cache/restore@v5
-        with:
-          path: /Users/runner/Library/Caches/ccache
-          key: ${{ env.CACHE_KEY }}-ccache-${{ hashFiles('cache-key') }}
-          restore-keys: ${{ env.CACHE_KEY }}-ccache-
-          # When not building, do a lookup so the cache
-          # does not get removed after 7 days with no use.
-          lookup-only: ${{ steps.build-restore.outputs.cache-hit }}
-
-      - name: Install ccache
-        if: steps.build-restore.outputs.cache-hit != 'true'
+      - name: Fetch public dependencies and apply native patches
         run: |
-          wget --progress=dot:mega https://github.com/ccache/ccache/releases/download/v4.10.2/ccache-4.10.2-darwin.tar.gz
-          tar xf ccache-4.10.2-darwin.tar.gz
-          printf '%s\n' "$PWD/ccache-4.10.2-darwin" >>"${GITHUB_PATH}"
+          set -euo pipefail
+          make fetchthirdparty
+          test "$(git -C base rev-parse HEAD)" = "${BASE_REV}"
+          git -C base diff --check
 
-      - name: Setup build cache
-        if: steps.build-restore.outputs.cache-hit != 'true'
-        run: |
-          set -x
-          which ccache
-          ccache --version
-          ccache --zero-stats
-          ccache --max-size=256M
-          ccache --show-config
-
-      # }}}
-
-      # Build. {{{
-
-      - name: Build
-        id: build
-        if: steps.build-restore.outputs.cache-hit != 'true'
-        run: make base
-
-      - name: Dump build timings
-        if: contains('failure success', steps.build.conclusion) && !cancelled()
-        run: make buildstats
-
-      # }}}
-
-      # Clean / save build cache. {{{
-
-      - name: Clean caches
-        if: contains('failure success', steps.build.conclusion) && !cancelled()
-        run: |
-          set -x
-          # Trim the build directory.
-          rm -rf build/{cmake,staging,thirdparty}
-          ccache --cleanup >/dev/null
-          ccache --show-stats --verbose
-
-      - name: Save build cache
-        uses: actions/cache/save@v5
-        if: steps.build-restore.outputs.cache-hit != 'true' && steps.ccache-restore.outputs.cache-hit != 'true'
+      - name: Restore compiler cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
         with:
-          path: /Users/runner/Library/Caches/ccache
-          key: ${{ steps.ccache-restore.outputs.cache-primary-key }}
+          path: .ccache
+          key: test-v1-${{ env.BASE_REV }}-${{ hashFiles('patches/koreader-base/*.patch') }}
+          restore-keys: |
+            test-v1-${{ env.BASE_REV }}-
 
-      # }}}
+      - name: Run native range-stream tests
+        # The first test command also builds the clean emulator workspace.
+        run: ./kodev test base webdav_range_stream
 
-      # Dump & check binaries. {{{
+      - name: Run frontend streaming tests
+        run: ./kodev test -b front remotedocument remote_pdfdocument network_manager
 
-      - name: Dump binaries runtime path & dependencies
-        run: make bininfo
+  build:
+    name: Kobo firmware 4 package
+    needs: test
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    container:
+      image: koreader/kokobo:2.0.0-22.04@sha256:b12b65f29c08ff9399c8671802f82b6dcb6b04f079ae171ad9479bd0754b8911
+    env:
+      BASH_ENV: /home/ko/.bashrc
+      CCACHE_DIR: ${{ github.workspace }}/.ccache
+      KODEBUG: ""
+      MAKEFLAGS: OUTPUT_DIR=build INSTALL_DIR=install PARALLEL_JOBS=3
+      TARGET: kobo
 
-      - name: Checking binaries for missing dependencies
-        run: make bincheck
-
-      # }}}
-
-      - name: Save build directory
-        uses: actions/cache/save@v5
-        if: steps.build-restore.outputs.cache-hit != 'true'
+    steps:
+      - name: Check out source
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
         with:
-          path: build
-          key: ${{ steps.build-restore.outputs.cache-primary-key }}
+          fetch-depth: 0
+          persist-credentials: false
 
-      - name: Test
-        run: ./base/utils/fake_tty.py make --assume-old=base testfront
+      - name: Fetch upstream tags
+        run: |
+          git fetch --force --tags https://github.com/koreader/koreader.git \
+            "+refs/tags/*:refs/tags/*"
 
-      # Generate / upload artifact. {{{
+      - name: Fetch public dependencies and apply native patches
+        run: |
+          set -euo pipefail
+          make fetchthirdparty
+          test "$(git -C base rev-parse HEAD)" = "${BASE_REV}"
+          git -C base diff --check
 
-      - name: Generate artifact
-        # Note: ensure the build skeleton is created, so there are no dangling
-        # symlinks (e.g. `data/dict`) to trip 7zip during artifact generation…
-        run: make skeleton update --assume-old=base
+      - name: Restore compiler cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+        with:
+          path: .ccache
+          key: kobo-v1-${{ env.BASE_REV }}-${{ hashFiles('patches/koreader-base/*.patch') }}
+          restore-keys: |
+            kobo-v1-${{ env.BASE_REV }}-
 
-      - name: Upload artifact
-        uses: actions/upload-artifact@v7
+      - name: Build release package
+        run: ./kodev release --ignore-translation "${TARGET}" 2>&1 | tee build-kobo.log
+
+      - name: Prepare and verify downloads
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+
+          install_zips=(koreader-kobo-*.zip)
+          ota_archives=(koreader-kobo-*.tar.xz)
+          test "${#install_zips[@]}" -eq 1
+          test "${#ota_archives[@]}" -eq 1
+
+          rm -rf dist
+          install -d dist
+          cp -- "${install_zips[0]}" dist/
+          ota_name="$(basename "${ota_archives[0]}" .tar.xz).updated.tar"
+          xz --decompress --stdout "${ota_archives[0]}" >"dist/${ota_name}"
+
+          unzip -t "${install_zips[0]}"
+          unzip -Z1 "${install_zips[0]}" >zip-contents.txt
+          tar -tf "dist/${ota_name}" >tar-contents.txt
+          grep -qx 'koreader/koreader.sh' tar-contents.txt
+          grep -qx 'koreader/ota/package.index' tar-contents.txt
+
+          plugin_list="$({
+            sed -n 's#^.*koreader/plugins/\([^/]*\)/.*#\1#p' zip-contents.txt
+          } | sort -u)"
+          test "${plugin_list}" = "cloudstorage.koplugin"
+
+          if grep -Eiq '(^|/)(\.env($|\.)|credentials?\.|secrets?\.|[^/]+\.(pem|p12|pfx|key)$)' \
+              zip-contents.txt tar-contents.txt; then
+            echo "A credential-like file was found in the release archive." >&2
+            exit 1
+          fi
+          rm zip-contents.txt tar-contents.txt
+
+          (
+            cd dist
+            sha256sum -- * >SHA256SUMS-kobo.txt
+            sha256sum --check SHA256SUMS-kobo.txt
+          )
+
+      - name: Upload install ZIP
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           archive: false
-          path: '*.7z'
+          path: dist/*.zip
+          if-no-files-found: error
+          retention-days: 30
 
-      # }}}
+      - name: Upload single-file updater
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          archive: false
+          path: dist/*.updated.tar
+          if-no-files-found: error
+          retention-days: 30
 
-# vim: foldmethod=marker foldlevel=0
+      - name: Upload checksums
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          archive: false
+          path: dist/SHA256SUMS-kobo.txt
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Upload build log on failure
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          archive: false
+          path: build-kobo.log
+          if-no-files-found: ignore
+          retention-days: 7
+
+  release:
+    name: Publish prerelease
+    if: startsWith(github.ref, 'refs/tags/stream.v')
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download verified packages
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          path: release-assets
+          merge-multiple: true
+          skip-decompress: true
+
+      - name: Verify release assets
+        run: |
+          set -euo pipefail
+          test "$(find release-assets -maxdepth 1 -type f | wc -l)" -eq 3
+          test "$(find release-assets -maxdepth 1 -type f -name '*.zip' | wc -l)" -eq 1
+          test "$(find release-assets -maxdepth 1 -type f -name '*.updated.tar' | wc -l)" -eq 1
+          test "$(find release-assets -maxdepth 1 -type f -name 'SHA256SUMS-kobo.txt' | wc -l)" -eq 1
+          cd release-assets
+          sha256sum --check SHA256SUMS-kobo.txt
+
+      - name: Create or update GitHub prerelease
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          if gh release view "${GITHUB_REF_NAME}" --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1; then
+            gh release upload "${GITHUB_REF_NAME}" release-assets/* \
+              --clobber \
+              --repo "${GITHUB_REPOSITORY}"
+          else
+            gh release create "${GITHUB_REF_NAME}" release-assets/* \
+              --generate-notes \
+              --notes "Experimental firmware-4 build. Back up the device before installing." \
+              --prerelease \
+              --title "KOReader Stream ${GITHUB_REF_NAME#stream.}" \
+              --verify-tag \
+              --repo "${GITHUB_REPOSITORY}"
+          fi
