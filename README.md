@@ -27,22 +27,6 @@ best-effort mode because solid RAR archives are not inherently random-access.
 The full design, security properties, limitations, and device-validation
 checklist are in [WebDAV comic streaming](doc/WebDAV_comic_streaming.md).
 
-## How it works
-
-```text
-Cloud Storage+ WebDAV selection
-  -> one-byte range capability probe
-  -> non-secret local descriptor
-  -> libcurl-backed seekable MuPDF stream
-  -> bounded RAM block cache
-  -> CBZ/CBR page rendering
-```
-
-Credentials are not written into the descriptor or committed to this
-repository. KOReader resolves them at runtime from its local Cloud Storage+
-settings. Native credential buffers and range-cache blocks are cleared when a
-remote document closes.
-
 ## Getting started
 
 Clone the project and all submodules:
@@ -86,29 +70,6 @@ limits, and battery impact must be validated on the device before deployment.
 CBZ is the recommended format. A solid CBR may require reading most of the
 archive to reach a later page; strict mode stops that inefficient transfer
 instead of silently downloading the complete file.
-
-## Repository structure
-
-- `frontend/`, `plugins/`, and `reader.lua`: WebDAV UI, descriptor lifecycle,
-  reader integration, privacy controls, and network behavior.
-- `base/`: the pinned private `koreader-stream-base` companion containing the
-  libcurl/MuPDF seekable stream and native tests.
-- `spec/`: frontend unit and integration tests.
-- `doc/WebDAV_comic_streaming.md`: detailed architecture and validation notes.
-
-The project currently tracks KOReader and `koreader-base` as upstreams. The
-other unchanged submodules continue to use their public KOReader repositories.
-
-## Security and private data
-
-- Never commit WebDAV URLs containing credentials, exported device settings,
-  `.env` files, private keys, access tokens, personal libraries, or downloaded
-  books.
-- Keep real server credentials only in local KOReader settings on the target
-  device or development environment.
-- Use synthetic credentials and fixtures in tests.
-- Before sharing a build or repository snapshot, scan both the working tree and
-  Git history for secrets.
 
 ## Upstream and license
 
