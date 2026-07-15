@@ -271,4 +271,30 @@ describe("MenuSorter module", function()
         assert.is_true(test_menu[1][2].id == "third2")
         assert.is_true(test_menu[1][3].id == "third4")
     end)
+    it("should expose only Cloud storage+ in this fork's Tools menus", function()
+        local filemanager_order = require("ui/elements/filemanager_menu_order")
+        local reader_order = require("ui/elements/reader_menu_order")
+
+        assert.are.same({ "cloudstorage" }, filemanager_order.tools)
+        assert.are.same({ "cloudstorage" }, reader_order.tools)
+
+        local function is_disabled(order, id)
+            for _, disabled_id in ipairs(order["KOMenu:disabled"]) do
+                if disabled_id == id then
+                    return true
+                end
+            end
+            return false
+        end
+        for _, id in ipairs({
+            "cloud_storage", "move_to_archive", "news_downloader", "text_editor", "wallabag",
+        }) do
+            assert.is_true(is_disabled(filemanager_order, id))
+        end
+        for _, id in ipairs({
+            "move_to_archive", "news_downloader", "text_editor", "wallabag",
+        }) do
+            assert.is_true(is_disabled(reader_order, id))
+        end
+    end)
 end)

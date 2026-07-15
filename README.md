@@ -1,104 +1,122 @@
-[![KOReader](https://raw.githubusercontent.com/koreader/koreader.github.io/master/koreader-logo.png)](https://koreader.rocks)
+# KOReader Stream
 
-#### KOReader is a document viewer primarily aimed at e-ink readers.
+KOReader Stream is an experimental, WebDAV-focused fork of
+[KOReader](https://github.com/koreader/koreader). It opens remote CBZ comics
+with seekable HTTP range requests, so a reader can jump between pages without
+first downloading the complete archive. CBR support is available in a strict,
+best-effort mode because solid RAR archives are not inherently random-access.
 
-[![AGPL Licence][badge-license]](COPYING)
-[![Latest release][badge-release]][link-gh-releases]
-[![Gitter][badge-gitter]][link-gitter]
-[![Mobileread][badge-mobileread]][link-forum]
-[![Build Status][badge-circleci]][link-circleci]
-[![Coverage Status][badge-coverage]][link-coverage]
-[![Weblate Status][badge-weblate]][link-weblate]
+> [!IMPORTANT]
+> This project still requires validation on its target Kobo hardware. Treat
+> builds as development artifacts, not production releases.
 
-[Download](https://github.com/koreader/koreader/releases) •
-[User guide](http://koreader.rocks/user_guide/) •
-[Wiki](https://github.com/koreader/koreader/wiki) •
-[Developer docs](http://koreader.rocks/doc/)
+## What this fork adds
 
-## Main features
+- Synchronous, seekable WebDAV streaming for CBZ and CBR documents.
+- A bounded in-memory block cache with configurable 8–64 MiB limits.
+- Strong response validation for byte ranges, file size, validators, redirects,
+  TLS, and truncated responses.
+- Configurable page lookahead and strict CBR transfer limits.
+- A network lease that keeps Wi-Fi available while a remote book is open.
+- Privacy controls that prevent remote pages, covers, and decoded tiles from
+  being persisted to disk.
+- Stable, non-secret book descriptors so reading progress can survive a remote
+  file's ETag changing.
+- A reduced Kobo package focused on reading and the Cloud Storage+ WebDAV flow.
 
-* **portable**: runs on embedded devices (Cervantes, Kindle, Kobo, PocketBook, reMarkable), Android and Linux computers. Developers can run a KOReader emulator in Linux and MacOS.
+The full design, security properties, limitations, and device-validation
+checklist are in [WebDAV comic streaming](doc/WebDAV_comic_streaming.md).
 
-* **multi-format documents**: supports fixed page formats (PDF, DjVu, CBT, CBZ) and reflowable e-book formats (EPUB, FB2, Mobi, DOC, RTF, HTML, CHM, TXT). Scanned PDF/DjVu documents can also be reflowed with the built-in K2pdfopt library. [ZIP files][link-wiki-zip] are also supported for some formats.
+## How it works
 
-* **full-featured reading**: multi-lingual user interface with a highly customizable reader view and many typesetting options. You can set arbitrary page margins, override line spacing and choose external fonts and styles. It has multi-lingual hyphenation dictionaries bundled into the application.
+```text
+Cloud Storage+ WebDAV selection
+  -> one-byte range capability probe
+  -> non-secret local descriptor
+  -> libcurl-backed seekable MuPDF stream
+  -> bounded RAM block cache
+  -> CBZ/CBR page rendering
+```
 
-* **integrated** with *calibre* (search metadata, receive ebooks wirelessly, browse library via OPDS), *Wallabag*, *Wikipedia*, *Google Translate* and other content providers.
+Credentials are not written into the descriptor or committed to this
+repository. KOReader resolves them at runtime from its local Cloud Storage+
+settings. Native credential buffers and range-cache blocks are cleared when a
+remote document closes.
 
-* **optimized for e-ink devices**: custom UI without animation, with paginated menus, adjustable text contrast, and easy zoom to fit content or page in paged media.
+## Getting started
 
-* **extensible**: via plugins
+Clone the project and all submodules:
 
-* **fast**: on some older devices, it has been measured to have less than half the page-turn delay as the built in reading software.
+```sh
+git clone --recurse-submodules https://github.com/yoshitaka420/koreader-stream.git
+cd koreader-stream
+```
 
-* **and much more**: look up words with StarDict dictionaries / Wikipedia, add your own online OPDS catalogs and RSS feeds, over-the-air software updates, an FTP client, an SSH server, …
+If the repository was cloned without submodules:
 
-Please check the [user guide](http://koreader.rocks/user_guide/) and the [wiki][link-wiki] to discover more features and to help us document them.
+```sh
+git submodule update --init --recursive
+```
 
-## Screenshots
+Follow KOReader's upstream documentation for
+[build environment setup](doc/Building.md) and
+[target-specific builds](doc/Building_targets.md). The common development
+checks are:
 
-<a href="https://github.com/koreader/koreader-artwork/raw/master/koreader-menu.png"><img src="https://github.com/koreader/koreader-artwork/raw/master/koreader-menu-thumbnail.png" alt="" width="200px"></a>
-<a href="https://github.com/koreader/koreader-artwork/raw/master/koreader-footnotes.png"><img src="https://github.com/koreader/koreader-artwork/raw/master/koreader-footnotes-thumbnail.png" alt="" width="200px"></a>
-<a href="https://github.com/koreader/koreader-artwork/raw/master/koreader-dictionary.png"><img src="https://github.com/koreader/koreader-artwork/raw/master/koreader-dictionary-thumbnail.png" alt="" width="200px"></a>
+```sh
+./kodev build
+./kodev check
+./kodev test -b base webdav_range_stream
+./kodev test -b front remotedocument remote_pdfdocument network_manager
+./kodev test -b all
+```
 
-## Installation
+For a Kobo Libra Colour, confirm the installed firmware before choosing
+`kobov4` or `kobov5`. Hardware behavior, suspend/resume, Wi-Fi recovery, memory
+limits, and battery impact must be validated on the device before deployment.
 
-Please follow the model specific steps for your device:
+## Using WebDAV streaming
 
-[Android](https://github.com/koreader/koreader/wiki/Installation-on-Android-devices) •
-[Cervantes](https://github.com/koreader/koreader/wiki/Installation-on-BQ-devices) •
-[Kindle](https://github.com/koreader/koreader/wiki/Installation-on-Kindle-devices) •
-[Kobo](https://github.com/koreader/koreader/wiki/Installation-on-Kobo-devices) •
-[Linux](https://github.com/koreader/koreader/wiki/Installation-on-desktop-linux) •
-[Pocketbook](https://github.com/koreader/koreader/wiki/Installation-on-PocketBook-devices) •
-[reMarkable](https://github.com/koreader/koreader/wiki/Installation-on-Remarkable)
+1. Configure a WebDAV server in Cloud Storage+ on the device.
+2. Open that server and select a `.cbz` or `.cbr` file.
+3. KOReader checks range-request support and opens the comic directly.
+4. Use **Streaming settings** in Cloud Storage+ to configure RAM cache size,
+   page lookahead, strict CBR behavior, progress retention, and network stats.
 
+CBZ is the recommended format. A solid CBR may require reading most of the
+archive to reach a later page; strict mode stops that inefficient transfer
+instead of silently downloading the complete file.
 
-## Development
+## Repository structure
 
-[Setting up a build environment](doc/Building.md) •
-[Collaborating with Git](doc/Collaborating_with_Git.md) •
-[Building targets](doc/Building_targets.md) •
-[Porting](doc/Porting.md) •
-[Developer docs](http://koreader.rocks/doc/)
+- `frontend/`, `plugins/`, and `reader.lua`: WebDAV UI, descriptor lifecycle,
+  reader integration, privacy controls, and network behavior.
+- `base/`: the pinned private `koreader-stream-base` companion containing the
+  libcurl/MuPDF seekable stream and native tests.
+- `spec/`: frontend unit and integration tests.
+- `doc/WebDAV_comic_streaming.md`: detailed architecture and validation notes.
 
-## Support
+The project currently tracks KOReader and `koreader-base` as upstreams. The
+other unchanged submodules continue to use their public KOReader repositories.
 
-KOReader is developed and supported by volunteers all around the world. There are many ways you can help:
+## Security and private data
 
-- [fix bugs][link-issues-bugs] and [implement new features][link-issues-features]
-- [translate the program into your language][link-weblate] or improve an existing translation
-- document lesser-known features on the [wiki][link-wiki]
-- help others with your knowledge on the [forum][link-forum]
+- Never commit WebDAV URLs containing credentials, exported device settings,
+  `.env` files, private keys, access tokens, personal libraries, or downloaded
+  books.
+- Keep real server credentials only in local KOReader settings on the target
+  device or development environment.
+- Use synthetic credentials and fixtures in tests.
+- Before sharing a build or repository snapshot, scan both the working tree and
+  Git history for secrets.
 
-Right now we only support [liberapay](https://liberapay.com/KOReader) donations.
+## Upstream and license
 
-## Contributors
+KOReader Stream is based on [KOReader](https://github.com/koreader/koreader)
+and its [koreader-base](https://github.com/koreader/koreader-base) framework.
+Upstream documentation and community support remain the best references for
+general KOReader behavior.
 
-[![Last commit][badge-last-commit]][link-gh-commits]
-[![Commit activity][badge-commit-activity]][link-gh-insights]
-
-[badge-bountysource]:https://img.shields.io/bountysource/team/koreader/activity?color=red
-[badge-circleci]:https://circleci.com/gh/koreader/koreader.svg?style=shield
-[badge-coverage]:https://codecov.io/gh/koreader/koreader/branch/master/graph/badge.svg
-[badge-commit-activity]:https://img.shields.io/github/commit-activity/m/koreader/koreader
-[badge-gitter]:https://img.shields.io/gitter/room/koreader/koreader?color=red
-[badge-last-commit]:https://img.shields.io/github/last-commit/koreader/koreader?color=orange
-[badge-license]:https://img.shields.io/github/license/koreader/koreader
-[badge-release]:https://img.shields.io/github/release/koreader/koreader.svg
-[badge-mobileread]:https://img.shields.io/badge/forum-on_mobileread-lightgrey
-[badge-weblate]:https://hosted.weblate.org/widgets/koreader/-/koreader/svg-badge.svg
-
-[link-bountysource]:https://www.bountysource.com/teams/koreader
-[link-circleci]:https://circleci.com/gh/koreader/koreader
-[link-coverage]:https://codecov.io/gh/koreader/koreader
-[link-forum]:http://www.mobileread.com/forums/forumdisplay.php?f=276
-[link-gh-commits]:https://github.com/koreader/koreader/commits/master
-[link-gh-insights]:https://github.com/koreader/koreader/pulse
-[link-gh-releases]:https://github.com/koreader/koreader/releases
-[link-gitter]:https://gitter.im/koreader/koreader
-[link-issues-bugs]:https://github.com/koreader/koreader/issues?q=is%3Aopen+is%3Aissue+label%3Abug
-[link-issues-features]:https://github.com/koreader/koreader/issues?q=is%3Aopen+is%3Aissue+label%3Aenhancement
-[link-weblate]:https://hosted.weblate.org/engage/koreader/?utm_source=widget
-[link-wiki]:https://github.com/koreader/koreader/wiki
-[link-wiki-zip]:https://github.com/koreader/koreader/wiki/ZIP
+The code is distributed under the GNU Affero General Public License v3.0. See
+[COPYING](COPYING). KOReader and the KOReader logo belong to their respective
+project and contributors.

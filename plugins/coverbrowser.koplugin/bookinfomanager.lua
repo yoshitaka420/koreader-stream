@@ -325,6 +325,21 @@ end
 function BookInfoManager:getBookInfo(filepath, get_cover)
     local directory, filename = util.splitFilePathName(filepath)
 
+    if require("document/remotedocument").isDescriptor(filepath) then
+        -- A real-looking .cbz/.cbr descriptor is needed by history, but its
+        -- contents and cover must never be indexed into this persistent DB.
+        return {
+            directory = directory,
+            filename = filename,
+            filesize = lfs.attributes(filepath, "size"),
+            filemtime = lfs.attributes(filepath, "modification"),
+            in_progress = 0,
+            cover_fetched = "Y",
+            ignore_meta = "Y",
+            ignore_cover = "Y",
+        }
+    end
+
     -- CoverBrowser may be used by PathChooser, which will not filter out
     -- files with unknown book extension. If not a supported extension,
     -- returns a bookinfo like-object enough for a correct display and
@@ -420,6 +435,9 @@ function BookInfoManager:getDocProps(filepath)
 end
 
 function BookInfoManager:extractBookInfo(filepath, cover_specs)
+    if require("document/remotedocument").isDescriptor(filepath) then
+        return true
+    end
     -- This will be run in a subprocess
     -- We use a temporary directory for cre cache (that will not affect parent process),
     -- so we don't fill the main cache with books we're not actually reading

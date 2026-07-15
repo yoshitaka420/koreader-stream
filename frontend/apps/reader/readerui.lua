@@ -24,6 +24,7 @@ local InputContainer = require("ui/widget/container/inputcontainer")
 local InputDialog = require("ui/widget/inputdialog")
 local LanguageSupport = require("languagesupport")
 local NetworkListener = require("ui/network/networklistener")
+local NetworkMgr = require("ui/network/manager")
 local Notification = require("ui/widget/notification")
 local PluginLoader = require("pluginloader")
 local ReaderActivityIndicator = require("apps/reader/modules/readeractivityindicator")
@@ -109,6 +110,23 @@ end
 
 function ReaderUI:registerPostReaderReadyCallback(callback)
     table.insert(self.postReaderReadyCallback, callback)
+end
+
+-- This fork is a page-at-a-time WebDAV reader.  Apply these settings on every
+-- open, after plugins have had a chance to load document settings, so an old
+-- sidecar cannot restore continuous view or a cropped/width-only zoom mode.
+function ReaderUI:enforceReaderViewDefaults()
+    if self.document.info.has_pages then
+        self.doc_settings:saveSetting("kopt_page_scroll", 0)
+        self.doc_settings:saveSetting("kopt_zoom_mode_genus", 4) -- page
+        self.doc_settings:saveSetting("kopt_zoom_mode_type", 2) -- full
+        self.doc_settings:saveSetting("zoom_mode", "page")
+        self.doc_settings:saveSetting("normal_zoom_mode", "page")
+        self.doc_settings:saveSetting("flipping_zoom_mode", "page")
+        self.doc_settings:saveSetting("flipping_scroll_mode", false)
+    else
+        self.doc_settings:saveSetting("copt_view_mode", 0) -- page
+    end
 end
 
 function ReaderUI:init()
@@ -480,6 +498,7 @@ function ReaderUI:init()
     -- Allow others to change settings based on external factors
     -- Must be called after plugins are loaded & before setting are read.
     self:handleEvent(Event:new("DocSettingsLoad", self.doc_settings, self.document))
+    self:enforceReaderViewDefaults()
     -- we only read settings after all the widgets are initialized
     self:handleEvent(Event:new("ReadSettings", self.doc_settings))
 
@@ -496,7 +515,9 @@ function ReaderUI:init()
 
     local md5 = self.doc_settings:readSetting("partial_md5_checksum")
     if md5 == nil then
-        md5 = self.md5_checksum or util.partialMD5(file)
+        md5 = self.md5_checksum
+            or require("document/remotedocument").getDescriptorIdentity(file)
+            or util.partialMD5(file)
         self.doc_settings:saveSetting("partial_md5_checksum", md5)
     end
     self.md5_checksum = nil
@@ -613,7 +634,7 @@ end
 --- @note: Will sanely close existing FileManager/ReaderUI instance for you!
 ---        This is the *only* safe way to instantiate a new ReaderUI instance!
 ---        (i.e., don't look at the testsuite, which resorts to all kinds of nasty hacks).
-function ReaderUI:showReader(file, provider, seamless, is_provider_forced, after_open_callback)
+function ReaderUI:showReader(file, provider, seamless, is_provider_forced, after_open_callback, source)
     logger.dbg("show reader ui")
 
     if lfs.attributes(file, "mode") ~= "file" then
@@ -638,12 +659,13 @@ function ReaderUI:showReader(file, provider, seamless, is_provider_forced, after
             self.after_open_callback = after_open_callback
             -- We can now signal the existing ReaderUI/FileManager instances that it's time to go bye-bye...
             UIManager:broadcastEvent(Event:new("ShowingReader"))
-            self:showReaderCoroutine(file, provider, seamless)
+            self:showReaderCoroutine(file, provider, seamless, source)
         end
         if BookList.hasBookBeenOpened(file) then
             do_show()
         else -- new book
-            self.md5_checksum = util.partialMD5(file)
+            self.md5_checksum = require("document/remotedocument").getDescriptorIdentity(file)
+                or util.partialMD5(file)
             local arc_settings_file = DocSettings.getSettingsArcFile(self.md5_checksum, true) -- check if exists
             if arc_settings_file then
                 UIManager:show(ConfirmBox:new{
@@ -708,7 +730,7 @@ function ReaderUI:extendProvider(file, provider, is_provider_forced)
     return provider
 end
 
-function ReaderUI:showReaderCoroutine(file, provider, seamless)
+function ReaderUI:showReaderCoroutine(file, provider, seamless, source)
     UIManager:show(InfoMessage:new{
         text = T(_("Opening file '%1'."), BD.filepath(filemanagerutil.abbreviate(file))),
         timeout = 0.0,
@@ -719,7 +741,7 @@ function ReaderUI:showReaderCoroutine(file, provider, seamless)
     UIManager:nextTick(function()
         logger.dbg("creating coroutine for showing reader")
         local co = coroutine.create(function()
-            self:doShowReader(file, provider, seamless)
+            self:doShowReader(file, provider, seamless, source)
         end)
         local ok, err = coroutine.resume(co)
         if err ~= nil or ok == false then
@@ -736,7 +758,7 @@ function ReaderUI:showReaderCoroutine(file, provider, seamless)
     end)
 end
 
-function ReaderUI:doShowReader(file, provider, seamless)
+function ReaderUI:doShowReader(file, provider, seamless, source)
     if seamless then
         UIManager:avoidFlashOnNextRepaint()
     end
@@ -746,10 +768,14 @@ function ReaderUI:doShowReader(file, provider, seamless)
         logger.warn("ReaderUI instance mismatch! Tried to spin up a new instance, while we still have an existing one:", tostring(ReaderUI.instance))
         ReaderUI.instance:onClose()
     end
-    local document = DocumentRegistry:openDocument(file, provider)
+    local document = DocumentRegistry:openDocument(file, provider, source)
     if not document then
+        local text = _("No reader engine for this file or invalid file.")
+        if require("document/remotedocument").isDescriptor(file) then
+            text = DocumentRegistry:getLastError(file) or text
+        end
         UIManager:show(InfoMessage:new{
-            text = _("No reader engine for this file or invalid file.")
+            text = text,
         })
         self:showFileManager(file)
         return
@@ -773,6 +799,10 @@ function ReaderUI:doShowReader(file, provider, seamless)
         reloading = self.reloading,
         after_open_callback = self.after_open_callback,
     }
+    if document.is_remote then
+        NetworkMgr:acquireNetworkLease("remote-document")
+        reader.remote_network_lease = true
+    end
     self.reloading = nil
     self.after_open_callback = nil
 
@@ -871,23 +901,74 @@ function ReaderUI:onClose(full_refresh)
         self:saveSettings()
     end
     local file
+    local forget_remote
+    local network_stats
+    local show_network_stats
+    local remote_source
     if self.document ~= nil then
         file = self.document.file
+        if self.document.is_remote then
+            remote_source = self.document.remote_source or {}
+            forget_remote = remote_source.forget_on_close and not self.preserve_remote_descriptor
+            show_network_stats = remote_source.show_network_stats and not self.preserve_remote_descriptor
+            network_stats = self.document:getNetworkStats()
+        end
         require("readhistory"):updateLastBookTime(self.tearing_down)
         require("readcollection"):updateLastBookTime(file)
         -- Serialize the most recently displayed page for later launch
-        DocCache:serialize(file)
+        if not self.document.is_remote then
+            DocCache:serialize(file)
+        end
         logger.dbg("closing document")
         self:handleEvent(Event:new("CloseDocument"))
         if self.document:isEdited() and not self.highlight.highlight_write_into_pdf then
             self.document:discardChange()
         end
+        if self.document.is_remote then
+            DocCache:evictDocument(file)
+        end
         self:closeDocument()
+        if remote_source and not self.preserve_remote_descriptor then
+            -- Native credentials have already been zeroed by closeDocument;
+            -- release the Lua references as well (Lua strings are immutable).
+            remote_source.password = nil
+            remote_source.username = nil
+            remote_source.url = nil
+        end
+    end
+    -- Release independently of document state so an already-closed document
+    -- cannot strand the inactivity-shutdown lease.
+    if self.remote_network_lease then
+        NetworkMgr:releaseNetworkLease("remote-document")
+        self.remote_network_lease = nil
     end
     UIManager:close(self.dialog, full_refresh ~= false and "full")
-    if file then
+    -- When self.dialog == self, UIManager:close invokes onFlushSettings().
+    -- Purge only after that final write or the forgotten sidecar would be
+    -- recreated immediately.
+    if forget_remote then
+        require("document/remotedocument").forget(file)
+    end
+    if file and not forget_remote then
         BookList.setBookInfoCacheProperty(file, "percent_finished", self.doc_settings:readSetting("percent_finished"))
         -- other cached properties of the currently opened document are updated in real time
+    end
+    self.preserve_remote_descriptor = nil
+    if show_network_stats and network_stats then
+        UIManager:show(InfoMessage:new{
+            text = T(_([[Remote streaming statistics
+
+Requests: %1
+Received: %2
+Opening transfer: %3
+Peak RAM block cache: %4
+Retries: %5]]),
+                network_stats.request_count,
+                util.getFriendlySize(network_stats.bytes_received),
+                util.getFriendlySize(network_stats.opening_bytes),
+                util.getFriendlySize(network_stats.peak_cached_bytes),
+                network_stats.retry_count),
+        })
     end
 end
 
@@ -940,6 +1021,7 @@ end
 function ReaderUI:reloadDocument(after_close_callback, seamless, after_open_callback)
     local file = self.document.file
     local provider = getmetatable(self.document).__index
+    local source = self.document.remote_source
 
     -- Mimic onShowingReader's refresh optimizations
     self.tearing_down = true
@@ -949,6 +1031,7 @@ function ReaderUI:reloadDocument(after_close_callback, seamless, after_open_call
     self:handleEvent(Event:new("CloseConfigMenu"))
     self:handleEvent(Event:new("PreserveCurrentSession")) -- don't reset statistics' start_current_period
     self.highlight:onClose() -- close highlight dialog if any
+    self.preserve_remote_descriptor = true
     self:onClose(false)
     if after_close_callback then
         -- allow caller to do stuff between close an re-open
@@ -956,7 +1039,7 @@ function ReaderUI:reloadDocument(after_close_callback, seamless, after_open_call
     end
 
     self.reloading = true
-    self:showReader(file, provider, seamless, nil, after_open_callback)
+    self:showReader(file, provider, seamless, nil, after_open_callback, source)
 end
 
 function ReaderUI:switchDocument(new_file, seamless, after_open_callback, provider, is_provider_forced)

@@ -1,4 +1,5 @@
 local DocumentRegistry = require("document/documentregistry")
+local RemoteDocument = require("document/remotedocument")
 local InfoMessage = require("ui/widget/infomessage")
 local MultiInputDialog = require("ui/widget/multiinputdialog")
 local NetworkMgr = require("ui/network/manager")
@@ -63,7 +64,7 @@ function WebDavApi.listFolder(address, user, pass, folder_path, include_folders)
     local webdav_url_path = WebDavApi.trim_slashes(util.urlDecode(webdav_url:match("^https?://[^/]*(.*)$") or webdav_url))
 
     local sink = {}
-    local data = [[<?xml version="1.0"?><a:propfind xmlns:a="DAV:"><a:prop><a:resourcetype/><a:getcontentlength/><a:getlastmodified/></a:prop></a:propfind>]]
+    local data = [[<?xml version="1.0"?><a:propfind xmlns:a="DAV:"><a:prop><a:resourcetype/><a:getcontentlength/><a:getlastmodified/><a:getetag/></a:prop></a:propfind>]]
     socketutil:set_timeout(socketutil.FILE_BLOCK_TIMEOUT, socketutil.FILE_TOTAL_TIMEOUT)
     local request = {
         url      = webdav_url,
@@ -106,6 +107,10 @@ function WebDavApi.listFolder(address, user, pass, folder_path, include_folders)
         if is_not_collection then
             if show_unsupported or DocumentRegistry:hasProvider(item_name) then
                 local file_size = tonumber(item:match("<[^:]*:getcontentlength[^>]*>(%d+)</[^:]*:getcontentlength>"))
+                local item_etag = item:match("<[^:]*:getetag[^>]*>(.-)</[^:]*:getetag>")
+                if item_etag then
+                    item_etag = util.htmlEntitiesToUtf8(item_etag)
+                end
                 local modification, suffix, mandatory
                 if include_folders then
                     local item_modified = item:match("<[^:]*:getlastmodified[^>]*>(.*)</[^:]*:getlastmodified>")
@@ -118,6 +123,7 @@ function WebDavApi.listFolder(address, user, pass, folder_path, include_folders)
                     text = item_name,
                     url = path .. "/" .. item_name,
                     filesize = file_size,
+                    etag = item_etag,
                     modification = modification,
                     suffix = suffix,
                     mandatory = mandatory,
@@ -235,6 +241,21 @@ function WebDav.downloadFile(url, local_path, progress_callback)
     return WebDavApi.downloadFile(path, base.username, base.password, local_path, progress_callback)
 end
 
+function WebDav.probeRange(url, expected_size)
+    local base = WebDav.base
+    local path = WebDavApi.getJoinedPath(base.address, url)
+    local ok, result = pcall(require("ffi/mupdf").probeRemote, {
+        url = path,
+        username = base.username,
+        password = base.password,
+        expected_size = expected_size or 0,
+    })
+    if not ok then
+        return nil, RemoteDocument.userError(result)
+    end
+    return result
+end
+
 function WebDav.uploadFile(url, local_path, etag)
     local base = WebDav.base
     local path = WebDavApi.getJoinedPath(base.address, url)
@@ -263,6 +284,7 @@ function WebDav.config(server_idx, caller_callback)
 This can point to a sub-directory of the WebDAV server.
 The start folder is appended to the server path.]])
     local item = server_idx and WebDav.base.servers[server_idx] or { type = WebDav.type }
+    RemoteDocument.ensureServerId(item)
     local settings_dialog
     settings_dialog = MultiInputDialog:new{
         title = _("WebDAV server settings"),
@@ -320,6 +342,7 @@ The start folder is appended to the server path.]])
                         item.username = fields[3]
                         item.password = fields[4]
                         item.url      = fields[5]
+                        RemoteDocument.ensureServerId(item)
                         UIManager:close(settings_dialog)
                         caller_callback(item)
                     end,

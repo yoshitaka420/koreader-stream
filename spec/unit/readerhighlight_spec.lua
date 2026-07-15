@@ -127,6 +127,9 @@ describe("Readerhighlight module", function()
             }
             readerui.hinting.view.hinting = false
             readerui:handleEvent(Event:new("SetScrollMode", false))
+            -- Keep the historical coordinate fixture for these selection
+            -- tests; full-page fit on open is covered by readerui_spec.
+            readerui.zooming:setZoomMode("contentwidth")
         end)
         teardown(function()
             readerui:onClose()

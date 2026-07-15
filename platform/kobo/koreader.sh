@@ -95,6 +95,10 @@ fi
 ko_update_check() {
     NEWUPDATE="${KOREADER_DIR}/ota/koreader.updated.tar"
     INSTALLED="${KOREADER_DIR}/ota/koreader.installed.tar"
+    # The installed archive is only a leftover from the previous successful
+    # update. Keep the active tree and external rollback backup, not a second
+    # full copy of the package on the Kobo volume.
+    rm -f "${INSTALLED}"
     if [ -f "${NEWUPDATE}" ]; then
         # Clear screen to delete UI leftovers
         ./fbink --cls

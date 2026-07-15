@@ -473,7 +473,8 @@ function Document:renderPage(pageno, rect, zoom, rotation, gamma, saturation, hi
 
     -- Prepare our BB, and wrap it in a cache item for DocCache
     tile = TileCacheItem:new{
-        persistent = not is_prescaled, -- we don't want to dump page fragments to disk (unnecessary, and it would confuse DocCache's heuristics)
+        persistent = not is_prescaled and not self.no_persistent_content_cache,
+        -- We don't want to dump page fragments (or any remote page) to disk.
         doc_path = self.file,
         created_ts = os.time(),
         excerpt = size,

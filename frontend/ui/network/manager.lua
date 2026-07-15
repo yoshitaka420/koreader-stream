@@ -34,7 +34,29 @@ local NetworkMgr = {
     -- SSID for which the current DHCP lease was obtained.
     -- Used by hasLeaseForCurrentNetwork() to detect stale leases after a network switch (#14790).
     lease_ssid = nil,
+    _network_leases = {},
 }
+
+function NetworkMgr:acquireNetworkLease(owner)
+    owner = owner or "anonymous"
+    self._network_leases[owner] = (self._network_leases[owner] or 0) + 1
+end
+
+function NetworkMgr:releaseNetworkLease(owner)
+    owner = owner or "anonymous"
+    local count = self._network_leases[owner]
+    if not count then
+        logger.warn("NetworkMgr: tried to release an unknown network lease", owner)
+    elseif count > 1 then
+        self._network_leases[owner] = count - 1
+    else
+        self._network_leases[owner] = nil
+    end
+end
+
+function NetworkMgr:hasNetworkLease()
+    return next(self._network_leases) ~= nil
+end
 
 function NetworkMgr:readNWSettings()
     self.nw_settings = LuaSettings:open(DataStorage:getSettingsDir().."/network.lua")

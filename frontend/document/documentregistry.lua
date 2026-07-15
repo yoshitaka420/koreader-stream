@@ -22,6 +22,7 @@ local DocumentRegistry = {
         tiff = true,
         webp = true,
     },
+    last_errors = {},
 }
 
 local function getSuffix(file)
@@ -226,7 +227,7 @@ function DocumentRegistry:mimeToExt(mimetype)
 end
 
 --- Returns a new Document instance on success
-function DocumentRegistry:openDocument(file, provider)
+function DocumentRegistry:openDocument(file, provider, source)
     -- force a GC, so that any previous document used memory can be reused
     -- immediately by this new document without having to wait for the
     -- next regular gc. The second call may help reclaming more memory.
@@ -236,14 +237,16 @@ function DocumentRegistry:openDocument(file, provider)
         provider = provider or self:getProvider(file)
 
         if provider ~= nil then
-            local ok, doc = pcall(provider.new, provider, {file = file})
+            local ok, doc = pcall(provider.new, provider, {file = file, source = source})
             if ok then
                 self.registry[file] = {
                     doc = doc,
                     refs = 1,
                 }
+                self.last_errors[file] = nil
             else
                 logger.warn("cannot open document", file, doc)
+                self.last_errors[file] = doc
             end
         end
     else
@@ -253,6 +256,10 @@ function DocumentRegistry:openDocument(file, provider)
     if self.registry[file] then
         return self.registry[file].doc
     end
+end
+
+function DocumentRegistry:getLastError(file)
+    return self.last_errors[file]
 end
 
 --- Does *NOT* finalize a Document instance, call its :close() instead if that's what you're looking for!

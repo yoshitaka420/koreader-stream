@@ -50,19 +50,33 @@ function Cloud:init()
             self.updated = true
         end,
     })
+    -- This WebDAV-focused build opens Cloud storage on top of the File
+    -- Manager as soon as startup has completed. Defer the action by one UI
+    -- tick: FileManager runs post-init callbacks while it is still being
+    -- constructed and is only placed on the widget stack afterwards.
+    -- ReaderUI also exposes registerPostInitCallback (and folder shortcuts),
+    -- so explicitly exclude document-backed UIs. Otherwise WebDAV is opened
+    -- over the freshly rendered book and looks like the reader crashed.
+    if not self.ui.document then
+        self.ui:registerPostInitCallback(function()
+            UIManager:nextTick(function()
+                if not self.ui.tearing_down then
+                    self:onShowWebDavStartup()
+                end
+            end)
+        end)
+    end
 end
 
 function Cloud:getProviders()
     if not Cloud.providers then
         Cloud.providers = {}
-        util.findFiles(self.path .. "/providers", function(fullpath, filename)
-            if filename:match("%.lua$") then
-                local ok, provider = pcall(dofile, fullpath)
-                if ok and next(provider) and provider.name and provider.config and provider.run and provider.listFolder then
-                    Cloud.providers[filename:sub(1, -5)] = provider
-                end
-            end
-        end, false)
+        local ok, provider = pcall(dofile, self.path .. "/providers/webdav.lua")
+        if ok and next(provider) and provider.name and provider.config and provider.run and provider.listFolder then
+            Cloud.providers.webdav = provider
+        else
+            logger.err("Cloud storage+: failed to load the WebDAV provider", provider)
+        end
     end
 end
 
@@ -74,6 +88,18 @@ function Cloud:loadSettings()
         end
     end
     self.servers = Cloud.settings:readSetting("cs_servers", {})
+    local RemoteDocument = require("document/remotedocument")
+    local migrated
+    for _, server in ipairs(self.servers) do
+        if server.type == "webdav" and RemoteDocument.ensureServerId(server) then
+            migrated = true
+        end
+    end
+    if migrated then
+        Cloud.settings:saveSetting("cs_servers", self.servers)
+        Cloud.settings:flush()
+    end
+    RemoteDocument.cleanupUnretained(Cloud.settings)
 end
 
 function Cloud:onFlushSettings()
@@ -96,7 +122,7 @@ function Cloud:addToMainMenu(menu_items)
     }
 end
 
-function Cloud:onShowCloudStorageList(caller_choose_folder_callback)
+function Cloud:onShowCloudStorageList(caller_choose_folder_callback, initial_server_idx)
     local base
     local CloudStorage = require("cloudstorage")
     base = CloudStorage:new{
@@ -105,6 +131,7 @@ function Cloud:onShowCloudStorageList(caller_choose_folder_callback)
         settings = self.settings,
         servers = self.servers,
         providers = self.providers,
+        initial_server_idx = initial_server_idx,
         _manager = self,
         -- external modules can call the plugin to choose the remote folder
         -- see CloudStorage:showFolderChooseDialog() for details of calling the callback
@@ -129,6 +156,22 @@ function Cloud:onShowCloudStorageList(caller_choose_folder_callback)
         provider.base = base
     end
     base:show()
+end
+
+function Cloud:onShowWebDavStartup()
+    local server_idx = self.settings:readSetting("default_server")
+    if not (server_idx and self.servers[server_idx]
+            and self.servers[server_idx].type == "webdav") then
+        server_idx = nil
+        for idx, server in ipairs(self.servers) do
+            if server.type == "webdav" then
+                server_idx = idx
+                break
+            end
+        end
+    end
+    self:onShowCloudStorageList(nil, server_idx)
+    return true
 end
 
 function Cloud:stopPlugin()

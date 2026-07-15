@@ -252,13 +252,11 @@ elseif directory then
 else
     -- Get which file to start with
     local last_file = G_reader_settings:readSetting("lastfile")
-    local start_with = G_reader_settings:readSetting("start_with") or "filemanager"
-
-    local QuickStart = require("ui/quickstart")
-    if not QuickStart:isShown() then
-        start_with = "last"
-        last_file = QuickStart:getQuickStart()
-    end
+    -- This WebDAV-focused build always enters FileManager on a normal launch;
+    -- the Cloud storage plugin then opens the configured WebDAV server on the
+    -- next UI tick. Explicit file and directory command-line launches above
+    -- remain available as recovery paths.
+    local start_with = "filemanager"
 
     if start_with == "last" and last_file and lfs.attributes(last_file, "mode") ~= "file" then
         local function retryLastFile()

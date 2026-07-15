@@ -460,6 +460,13 @@ end
 
 function BookInfo:getCoverImage(document, file, force_orig)
     local curr_file = document and document.file
+    local RemoteDocument = require("document/remotedocument")
+    if (document and document.is_remote)
+            or RemoteDocument.isDescriptor(file or curr_file) then
+        -- Remote archive images must not be copied into cover, screensaver,
+        -- or thumbnail caches. The reader can still display the live page.
+        return
+    end
     local cover_bb
     -- check for a custom cover (orig cover is forcibly requested in "Book information" only)
     if not force_orig then

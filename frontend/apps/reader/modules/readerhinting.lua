@@ -12,7 +12,8 @@ end
 
 function ReaderHinting:onHintPage()
     if not self.view.hinting then return true end
-    for i=1, DHINTCOUNT do
+    local hint_count = self.document.remote_source and self.document.remote_source.lookahead or DHINTCOUNT
+    for i=1, hint_count do
         if self.view.state.page + i <= self.document.info.number_of_pages then
             self.document:hintPage(
                 self.view.state.page + i,

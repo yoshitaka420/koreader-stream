@@ -61,6 +61,9 @@ function DocCache:serialize(doc_path)
     if not self.disk_cache then
         return
     end
+    if doc_path and require("document/remotedocument").isDescriptor(doc_path) then
+        return
+    end
 
     -- Calculate the current disk cache size
     local cached_size = 0
@@ -116,6 +119,20 @@ function DocCache:serialize(doc_path)
     end
     -- We may have updated the disk cache's content, so refresh its state
     self:refreshSnapshot()
+end
+
+function DocCache:evictDocument(doc_path)
+    if not doc_path then return end
+    local keys = {}
+    for key, item in self.cache:pairs() do
+        if item.doc_path == doc_path
+                or (type(key) == "string" and key:find(doc_path, 1, true)) then
+            table.insert(keys, key)
+        end
+    end
+    for _, key in ipairs(keys) do
+        self.cache:delete(key)
+    end
 end
 
 return DocCache

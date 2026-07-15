@@ -141,7 +141,7 @@ function NetworkListener:_scheduleActivityCheck()
         local noise_threshold = delay_seconds / default_network_timeout_seconds * network_activity_noise_margin
         local delta = tx_packets - NetworkListener._last_tx_packets
         -- If there was no meaningful activity (+/- a couple packets), kill the Wi-Fi
-        if delta <= noise_threshold then
+        if delta <= noise_threshold and not NetworkMgr:hasNetworkLease() then
             logger.dbg("NetworkListener: No meaningful network activity (delta:", delta, "<= threshold:", noise_threshold, "[ then:", NetworkListener._last_tx_packets, "vs. now:", tx_packets, "]) -> disabling Wi-Fi")
             keep_checking = false
             NetworkMgr:disableWifi()
@@ -219,7 +219,8 @@ end
 -- If the platform implements NetworkMgr:restoreWifiAsync, run it as needed
 if Device:hasWifiRestore() then
     function NetworkListener:onResume()
-        if NetworkMgr.wifi_was_on and G_reader_settings:isTrue("auto_restore_wifi") then
+        if NetworkMgr.wifi_was_on
+                and (G_reader_settings:isTrue("auto_restore_wifi") or NetworkMgr:hasNetworkLease()) then
             logger.dbg("NetworkListener: onResume will restore Wi-Fi in the background")
             NetworkMgr:restoreWifiAsync()
             NetworkMgr:scheduleConnectivityCheck()

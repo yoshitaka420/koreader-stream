@@ -8,6 +8,7 @@ local DrawContext = require("ffi/drawcontext")
 local logger = require("logger")
 local util = require("util")
 local ffi = require("ffi")
+local _ = require("gettext")
 local C = ffi.C
 local pdf = nil
 
@@ -25,7 +26,25 @@ function PdfDocument:init()
     self.koptinterface = require("document/koptinterface")
     self.koptinterface:setDefaultConfigurable(self.configurable)
     local ok
-    ok, self._document = pcall(pdf.openDocument, self.file)
+    local RemoteDocument = require("document/remotedocument")
+    local is_remote = self.source ~= nil or RemoteDocument.isDescriptor(self.file)
+    if is_remote then
+        ok, self.remote_source = pcall(RemoteDocument.resolve, self.file, self.source)
+        if not ok then error(self.remote_source) end
+        if not self.remote_source then
+            error(_("The remote-book descriptor is invalid or missing."))
+        end
+        ok, self._document = pcall(pdf.openRemoteDocument, self.remote_source)
+        if not ok then
+            error(RemoteDocument.userError(self._document))
+        end
+        self.is_remote = true
+        self.is_read_only = true
+        self.no_persistent_content_cache = true
+        DocCache:evictDocument(self.file)
+    else
+        ok, self._document = pcall(pdf.openDocument, self.file)
+    end
     if not ok then
         error(self._document)  -- will contain error message
     end
@@ -193,6 +212,7 @@ end
 
 -- returns nil if file is not a pdf, true if document is a writable pdf, false else
 function PdfDocument:_checkIfWritable()
+    if self.is_remote then return false end
     local suffix = util.getFileNameSuffix(self.file)
     if string.lower(suffix) ~= "pdf" then return nil end
     if self.is_writable == nil then
@@ -307,8 +327,17 @@ function PdfDocument:getEmbeddedAnnotations()
 end
 
 function PdfDocument:writeDocument()
+    if self.is_remote then return end
     logger.info("writing document to", self.file)
     self._document:writeDocument(self.file)
+end
+
+function PdfDocument:getNetworkStats()
+    return self._document and self._document:getNetworkStats()
+end
+
+function PdfDocument:clearRemoteCache()
+    if self._document then self._document:clearRemoteCache() end
 end
 
 function PdfDocument:close()

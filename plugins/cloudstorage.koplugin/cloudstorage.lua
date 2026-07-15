@@ -163,7 +163,12 @@ function CloudStorage:sortItemTable(tbl, url)
 end
 
 function CloudStorage:show()
-    local default_server_idx = self.settings:readSetting("default_server")
+    local default_server_idx = self.initial_server_idx
+        or self.settings:readSetting("default_server")
+    self.initial_server_idx = nil
+    if default_server_idx and not self.servers[default_server_idx] then
+        default_server_idx = nil
+    end
     if default_server_idx then -- open default server
         self.server_idx = default_server_idx
         local url = self.servers[default_server_idx].url
@@ -254,10 +259,69 @@ function CloudStorage:onMenuSelect(item)
             self.remote_selected_files[item.url] = item.dim
             self:updateItems(1, true)
         else
-            self:showFileDownloadDialog(item)
+            local suffix = (item.suffix or util.getFileNameSuffix(item.text) or ""):lower()
+            if self.provider.type == "webdav" and (suffix == "cbz" or suffix == "cbr") then
+                self:startStreaming(item)
+            else
+                self:showFileDownloadDialog(item)
+            end
         end
     end
     return true
+end
+
+function CloudStorage:startStreaming(item)
+    self.provider.run(function()
+        local probing = InfoMessage:new{ text = _("Checking byte-range streaming support…"), timeout = 0 }
+        UIManager:show(probing)
+        UIManager:forceRePaint()
+        local probe, err = self.provider.probeRange(item.url, item.filesize)
+        UIManager:close(probing)
+        if not probe then
+            UIManager:show(InfoMessage:new{ text = err })
+            return
+        end
+
+        local server = self.servers[self.server_idx]
+        local RemoteDocument = require("document/remotedocument")
+        if RemoteDocument.ensureServerId(server) then
+            self.settings:saveSetting("cs_servers", self.servers)
+        end
+        -- The descriptor is reopened outside the cloud-storage plugin, so its
+        -- server UUID must be durable before ReaderUI is started.
+        self.settings:flush()
+        local suffix = (item.suffix or util.getFileNameSuffix(item.text) or ""):lower()
+        -- Validators returned by PROPFIND may describe the WebDAV resource,
+        -- while the ranged GET is served by a redirecting CDN with different
+        -- validator semantics. Only persist validators observed through the
+        -- actual ranged GET probe; otherwise a catalog ETag can make every
+        -- subsequent range request fail (or trigger a full 200 response).
+        local validator_etag, validator_last_modified = RemoteDocument.getProbeValidators(probe)
+        local function openRemoteBook()
+            local ok, descriptor_path = pcall(RemoteDocument.create, {
+                provider = "webdav",
+                server_id = server.id,
+                remote_path = item.url,
+                display_name = item.text,
+                size = probe.content_length,
+                etag = validator_etag,
+                last_modified = validator_last_modified,
+                extension = suffix,
+            })
+            if not ok then
+                UIManager:show(InfoMessage:new{ text = RemoteDocument.userError(descriptor_path) })
+                return
+            end
+            local ok_source, source = pcall(RemoteDocument.resolve, descriptor_path)
+            if not ok_source or not source then
+                UIManager:show(InfoMessage:new{ text = RemoteDocument.userError(source) })
+                return
+            end
+            self:onCloseAllMenus()
+            require("apps/reader/readerui"):showReader(descriptor_path, nil, nil, nil, nil, source)
+        end
+        openRemoteBook()
+    end)
 end
 
 function CloudStorage:onMenuHold(item)
@@ -593,6 +657,98 @@ function CloudStorage:showPlusRootDialog()
     UIManager:show(plus_root_dialog)
 end
 
+function CloudStorage:showStreamingSettingsDialog()
+    local dialog
+    local function reopen()
+        UIManager:close(dialog)
+        self:showStreamingSettingsDialog()
+    end
+    local function save(key, value)
+        self.settings:saveSetting(key, value)
+        self._manager.updated = true
+    end
+    local cache_mb = self.settings:readSetting("webdav_stream_cache_mb", 32)
+    local lookahead = self.settings:readSetting("webdav_stream_lookahead", 1)
+    local retain = self.settings:nilOrTrue("webdav_stream_retain_progress")
+    dialog = ButtonDialog:new{
+        title = _("WebDAV comic streaming"),
+        title_align = "center",
+        buttons = {
+            {
+                {
+                    text = T(_("RAM block cache: %1 MB"), cache_mb),
+                    callback = function()
+                        UIManager:show(ButtonSelector:new{
+                            current_value = cache_mb,
+                            values = {
+                                { "8 MB", 8 }, { "16 MB", 16 },
+                                { "32 MB", 32 }, { "64 MB", 64 },
+                            },
+                            callback = function(value)
+                                save("webdav_stream_cache_mb", value)
+                                reopen()
+                            end,
+                        })
+                    end,
+                },
+            },
+            {
+                {
+                    text = T(_("Page lookahead: %1"), lookahead),
+                    callback = function()
+                        UIManager:show(ButtonSelector:new{
+                            current_value = lookahead,
+                            values = {
+                                { _("Off"), 0 }, { "1", 1 }, { "2", 2 },
+                            },
+                            callback = function(value)
+                                save("webdav_stream_lookahead", value)
+                                reopen()
+                            end,
+                        })
+                    end,
+                },
+            },
+            {
+                {
+                    text = _("Strict CBR streaming"),
+                    checked_func = function() return self.settings:nilOrTrue("webdav_stream_strict") end,
+                    callback = function()
+                        save("webdav_stream_strict", not self.settings:nilOrTrue("webdav_stream_strict"))
+                        reopen()
+                    end,
+                },
+            },
+            {
+                {
+                    text = retain and _("After closing: retain progress") or _("After closing: forget book"),
+                    callback = function()
+                        save("webdav_stream_retain_progress", not retain)
+                        reopen()
+                    end,
+                },
+            },
+            {
+                {
+                    text = _("Show per-book network statistics"),
+                    checked_func = function() return self.settings:isTrue("webdav_stream_show_stats") end,
+                    callback = function()
+                        save("webdav_stream_show_stats", not self.settings:isTrue("webdav_stream_show_stats"))
+                        reopen()
+                    end,
+                },
+            },
+            {
+                {
+                    text = _("Close"),
+                    callback = function() UIManager:close(dialog) end,
+                },
+            },
+        },
+    }
+    UIManager:show(dialog)
+end
+
 function CloudStorage:showPlusCloudDialog()
     local url = self.paths[#self.paths].url
     local plus_cloud_dialog
@@ -624,6 +780,16 @@ function CloudStorage:showPlusCloudDialog()
                     callback = function()
                         UIManager:close(plus_cloud_dialog)
                         self:showFileUploadDialog(url)
+                    end,
+                },
+            },
+            {
+                {
+                    text = _("Streaming settings"),
+                    enabled = self.provider.type == "webdav",
+                    callback = function()
+                        UIManager:close(plus_cloud_dialog)
+                        self:showStreamingSettingsDialog()
                     end,
                 },
             },

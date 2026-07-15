@@ -18,6 +18,15 @@ local HISTORY_DIR = DataStorage:getHistoryDir()
 local DOCSETTINGS_DIR = DataStorage:getDocSettingsDir()
 local DOCSETTINGS_HASH_DIR = DataStorage:getDocSettingsHashDir()
 local custom_metadata_filename = "custom_metadata.lua"
+local remote_books_root = DataStorage:getDataDir() .. "/remote-books/"
+
+local function getRemoteBookIdentity(doc_path)
+    if type(doc_path) ~= "string" or doc_path:sub(1, #remote_books_root) ~= remote_books_root then
+        return
+    end
+    local identity = doc_path:sub(#remote_books_root + 1):match("^([0-9a-fA-F]+)/")
+    if identity and #identity == 32 then return identity:lower() end
+end
 
 function DocSettings.getSidecarStorage(location)
     if location == "dir" then
@@ -124,7 +133,7 @@ function DocSettings:getSidecarDir(doc_path, force_location)
     elseif location == "hash" then
         local hsh = doc_hash_cache[doc_path]
         if not hsh then
-            hsh = util.partialMD5(doc_path)
+            hsh = getRemoteBookIdentity(doc_path) or util.partialMD5(doc_path)
             if not hsh then -- fallback to "doc"
                 return path .. ".sdr"
             end
