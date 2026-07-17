@@ -247,7 +247,7 @@ table.insert(quickstart_guide, _([[## Transferring files <a id="tfiles"></a>
 In addition to transferring files the same way you would with the built-in reader application, other options are available depending on your device:
 
 1. USB Mass Storage mode within KOReader
-2. Cloud storage (Dropbox/FTP/Webdav)
+2. WebDAV comic streaming
 3. SSH/SFTP access
 4. Calibre transfer
 5. News downloader

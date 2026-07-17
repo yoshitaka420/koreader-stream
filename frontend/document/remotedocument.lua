@@ -19,6 +19,8 @@ local RemoteDocument = {
 -- absolute root so either spelling resolves to the same remote descriptor.
 local descriptor_root = DataStorage:getFullDataDir() .. "/remote-books"
 local cloud_settings_path = DataStorage:getSettingsDir() .. "/cloudstorage.lua"
+local read_state_path = DataStorage:getSettingsDir() .. "/webdav_read_state.lua"
+local READ_ITEMS_KEY = "read_items"
 
 local function clamp(value, minimum, maximum, default)
     value = tonumber(value) or default
@@ -60,6 +62,110 @@ end
 function RemoteDocument.getIdentity(server_id, remote_path)
     assert(type(server_id) == "string" and server_id ~= "", "server ID is required")
     return md5(server_id .. "\0" .. RemoteDocument.normalizePath(remote_path))
+end
+
+local function getReadSettings()
+    return LuaSettings:open(read_state_path)
+end
+
+local function getReadItems(settings)
+    local items = settings:readSetting(READ_ITEMS_KEY, {})
+    return type(items) == "table" and items or {}
+end
+
+function RemoteDocument.getReadStatePath()
+    return read_state_path
+end
+
+function RemoteDocument.getReadStates(server_id)
+    assert(type(server_id) == "string" and server_id ~= "", "server ID is required")
+    local states = {}
+    for _, item in pairs(getReadItems(getReadSettings())) do
+        if type(item) == "table" and item.server_id == server_id
+                and type(item.remote_path) == "string" then
+            local ok, normalized_path = pcall(RemoteDocument.normalizePath, item.remote_path)
+            if ok then
+                -- Records written before explicit unread support had no
+                -- is_read member and represented the read state implicitly.
+                states[normalized_path] = item.is_read ~= false
+            end
+        end
+    end
+    return states
+end
+
+function RemoteDocument.getReadState(server_id, remote_path)
+    assert(type(server_id) == "string" and server_id ~= "", "server ID is required")
+    local normalized_path = RemoteDocument.normalizePath(remote_path)
+    local identity = RemoteDocument.getIdentity(server_id, normalized_path)
+    local item = getReadItems(getReadSettings())[identity]
+    if type(item) ~= "table" or item.server_id ~= server_id
+            or type(item.remote_path) ~= "string" then
+        return
+    end
+    local ok, item_path = pcall(RemoteDocument.normalizePath, item.remote_path)
+    if not ok or item_path ~= normalized_path then return end
+    return item.is_read ~= false
+end
+
+function RemoteDocument.isRead(server_id, remote_path)
+    return RemoteDocument.getReadState(server_id, remote_path) == true
+end
+
+function RemoteDocument.setReadState(server_id, remote_path, is_read)
+    assert(type(server_id) == "string" and server_id ~= "", "server ID is required")
+    assert(type(is_read) == "boolean", "read state must be a boolean")
+    local normalized_path = RemoteDocument.normalizePath(remote_path)
+    if RemoteDocument.getReadState(server_id, normalized_path) == is_read then
+        return true
+    end
+    local identity = RemoteDocument.getIdentity(server_id, normalized_path)
+    local settings = getReadSettings()
+    local items = getReadItems(settings)
+    items[identity] = {
+        server_id = server_id,
+        remote_path = normalized_path,
+        is_read = is_read,
+    }
+    settings:saveSetting(READ_ITEMS_KEY, items)
+    settings:flush()
+    -- LuaSettings:flush() historically does not propagate write errors.
+    -- Reopen the file so the UI never reports a durable change that only
+    -- existed in this Lua table.
+    if RemoteDocument.getReadState(server_id, normalized_path) ~= is_read then
+        error("could not save WebDAV read state")
+    end
+    return true
+end
+
+function RemoteDocument.clearReadStates(server_id, remote_path, recursive)
+    assert(type(server_id) == "string" and server_id ~= "", "server ID is required")
+    local normalized_path = RemoteDocument.normalizePath(remote_path)
+    local descendant_prefix = normalized_path == "/" and "/" or normalized_path .. "/"
+    local settings = getReadSettings()
+    local items = getReadItems(settings)
+    local cleared = 0
+    for identity, item in pairs(items) do
+        if type(item) == "table" and item.server_id == server_id
+                and type(item.remote_path) == "string" then
+            local ok, item_path = pcall(RemoteDocument.normalizePath, item.remote_path)
+            local matches = ok and (item_path == normalized_path
+                or (recursive and item_path:sub(1, #descendant_prefix) == descendant_prefix))
+            if matches then
+                items[identity] = nil
+                cleared = cleared + 1
+            end
+        end
+    end
+    if cleared > 0 then
+        if next(items) then
+            settings:saveSetting(READ_ITEMS_KEY, items)
+        else
+            settings:delSetting(READ_ITEMS_KEY)
+        end
+        settings:flush()
+    end
+    return cleared
 end
 
 function RemoteDocument.getDescriptorRoot()
@@ -188,7 +294,9 @@ function RemoteDocument.resolve(path, supplied_source)
     if cache_mb ~= 8 and cache_mb ~= 16 and cache_mb ~= 32 and cache_mb ~= 64 then
         cache_mb = 32
     end
-    local lookahead = clamp(settings:readSetting("webdav_stream_lookahead"), 0, 2, 1)
+    -- Remote hinting is synchronous: it downloads, decodes and renders every
+    -- hinted page. Keep that speculative radio/CPU work opt-in on Kobo.
+    local lookahead = clamp(settings:readSetting("webdav_stream_lookahead"), 0, 2, 0)
     local strict = settings:nilOrTrue("webdav_stream_strict")
     local retain_progress = settings:nilOrTrue("webdav_stream_retain_progress")
     local extension = descriptor.extension:lower()
@@ -271,6 +379,35 @@ function RemoteDocument.forget(path)
     local directory = path:match("^(.*)/[^/]+$")
     if directory then util.removePath(directory) end
     return true
+end
+
+function RemoteDocument.forgetRemote(server_id, remote_path, recursive)
+    assert(type(server_id) == "string" and server_id ~= "", "server ID is required")
+    local normalized_path = RemoteDocument.normalizePath(remote_path)
+    RemoteDocument.clearReadStates(server_id, normalized_path, recursive)
+    local search_root = descriptor_root
+    if not recursive then
+        search_root = search_root .. "/" .. RemoteDocument.getIdentity(server_id, normalized_path)
+    end
+    if lfs.attributes(search_root, "mode") ~= "directory" then return 0 end
+
+    local descriptor_paths = {}
+    util.findFiles(search_root, function(path)
+        table.insert(descriptor_paths, path)
+    end, true)
+
+    local forgotten = 0
+    local descendant_prefix = normalized_path == "/" and "/" or normalized_path .. "/"
+    for _, path in ipairs(descriptor_paths) do
+        local descriptor = RemoteDocument.load(path)
+        local matches = descriptor and descriptor.server_id == server_id
+            and (descriptor.remote_path == normalized_path
+                or (recursive and descriptor.remote_path:sub(1, #descendant_prefix) == descendant_prefix))
+        if matches and RemoteDocument.forget(path) then
+            forgotten = forgotten + 1
+        end
+    end
+    return forgotten
 end
 
 function RemoteDocument.cleanupUnretained(settings)

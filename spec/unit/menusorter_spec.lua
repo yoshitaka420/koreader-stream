@@ -287,7 +287,7 @@ describe("MenuSorter module", function()
             return false
         end
         for _, id in ipairs({
-            "cloud_storage", "move_to_archive", "news_downloader", "text_editor", "wallabag",
+            "move_to_archive", "news_downloader", "text_editor", "wallabag",
         }) do
             assert.is_true(is_disabled(filemanager_order, id))
         end

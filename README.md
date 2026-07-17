@@ -17,13 +17,15 @@ best-effort mode because solid RAR archives are not inherently random-access.
 - A bounded in-memory block cache with configurable 8–64 MiB limits.
 - Strong response validation for byte ranges, file size, validators, redirects,
   TLS, and truncated responses.
-- Configurable page lookahead and strict CBR transfer limits.
+- Opt-in page lookahead and strict CBR transfer limits.
 - A network lease that keeps Wi-Fi available while a remote book is open.
+- Kobo power defaults that suspend after inactivity, stop idle TCP probes, and
+  turn Wi-Fi off when it is no longer needed.
 - Privacy controls that prevent remote pages, covers, and decoded tiles from
   being persisted to disk.
 - Stable, non-secret book descriptors so reading progress can survive a remote
   file's ETag changing.
-- A reduced Kobo package focused on reading and the Cloud Storage+ WebDAV flow.
+- A reduced Kobo package focused on reading and the WebDAV streaming flow.
 
 The full design, security properties, limitations, and device-validation
 checklist are in [WebDAV comic streaming](doc/WebDAV_comic_streaming.md).
@@ -67,7 +69,10 @@ checks are:
 ./kodev build
 ./kodev check
 ./kodev test -b base webdav_range_stream
-./kodev test -b front remotedocument remote_pdfdocument network_manager
+./kodev test -b front autosuspend cloudstorage_stream menusorter network_manager \
+    networklistener pluginloader readerhighlight readerhinting readerpaging \
+    readerstatus_remote readerui remotedocument remote_pdfdocument version \
+    webdav_delete
 ./kodev test -b all
 ```
 
@@ -85,15 +90,51 @@ Create the same package produced by GitHub Actions with:
 
 ## Using WebDAV streaming
 
-1. Configure a WebDAV server in Cloud Storage+ on the device.
+1. Configure a WebDAV server in **WebDAV streaming** on the device.
 2. Open that server and select a `.cbz` or `.cbr` file.
 3. KOReader checks range-request support and opens the comic directly.
-4. Use **Streaming settings** in Cloud Storage+ to configure RAM cache size,
-   page lookahead, strict CBR behavior, progress retention, and network stats.
+4. Use **Streaming settings** in **WebDAV streaming** to configure RAM cache size,
+   page lookahead, idle Wi-Fi shutdown, strict CBR behavior, progress retention,
+   and network stats.
+5. Reaching the end of a streamed book marks it as read. Read books show a
+   checkmark in the WebDAV list; long-press a file to mark it read or unread
+   manually.
+6. Long-press a remote file or folder and choose **Delete** to remove it from
+   WebDAV. Folder deletion includes its contents.
+
+The focused WebDAV browser lists streamable CBZ/CBR books and folders only;
+generic cloud download, upload, folder creation, and folder-sync actions are
+not exposed.
+
+WebDAV read/unread state is stored by server and normalized remote path in a
+dedicated settings file. It is flushed immediately, survives KOReader
+restarts, and remains available even when per-book progress retention is
+disabled.
 
 CBZ is the recommended format. A solid CBR may require reading most of the
 archive to reach a later page; strict mode stops that inefficient transfer
 instead of silently downloading the complete file.
+
+Remote deletion is permanent unless the WebDAV service implements its own
+trash or recovery policy. KOReader also removes matching local remote-book
+descriptors and retained progress after the server confirms deletion. Close a
+remote book before deleting that book or one of its parent folders.
+
+## Kobo power defaults
+
+New Kobo profiles enable KOReader's inactive-Wi-Fi shutdown and leave remote
+page lookahead off. Lookahead downloads and renders pages before they are
+requested, so enable 1 or 2 only when lower page-turn latency matters more than
+radio and CPU use. A remote book keeps a network lease while it is open so an
+uncached page never fails merely because Wi-Fi went to sleep; closing the book
+allows the normal inactivity timer to turn Wi-Fi off.
+
+The focused Kobo package includes KOReader's **Auto power save** and
+**Automatic dimmer** plugins. Autosuspend retains KOReader's 15-minute default
+as a safety net even when a sleep-cover event is missed. The dimmer remains
+opt-in under **Settings → Screen → Automatic dimmer**. Suspend remains the
+largest safe idle-power saving; autostandby is deliberately not enabled by
+this fork because its hardware reliability varies between Kobo generations.
 
 ## Upstream and license
 

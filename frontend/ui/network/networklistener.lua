@@ -140,12 +140,19 @@ function NetworkListener:_scheduleActivityCheck()
         local delay_seconds = NetworkListener._activity_check_delay_seconds or default_network_timeout_seconds
         local noise_threshold = delay_seconds / default_network_timeout_seconds * network_activity_noise_margin
         local delta = tx_packets - NetworkListener._last_tx_packets
-        -- If there was no meaningful activity (+/- a couple packets), kill the Wi-Fi
-        if delta <= noise_threshold and not NetworkMgr:hasNetworkLease() then
-            logger.dbg("NetworkListener: No meaningful network activity (delta:", delta, "<= threshold:", noise_threshold, "[ then:", NetworkListener._last_tx_packets, "vs. now:", tx_packets, "]) -> disabling Wi-Fi")
-            keep_checking = false
-            NetworkMgr:disableWifi()
-            -- NOTE: We leave wifi_was_on as-is on purpose, we wouldn't want to break auto_restore_wifi workflows on the next start...
+        -- If there was no meaningful activity (+/- a couple packets), kill the
+        -- Wi-Fi unless an active workflow still owns the network. Keeping this
+        -- separate from the actual-traffic branch also avoids misleading logs
+        -- for a completely idle leased connection.
+        if delta <= noise_threshold then
+            if NetworkMgr:hasNetworkLease() then
+                logger.dbg("NetworkListener: No meaningful network activity, but an active network lease is keeping Wi-Fi enabled")
+            else
+                logger.dbg("NetworkListener: No meaningful network activity (delta:", delta, "<= threshold:", noise_threshold, "[ then:", NetworkListener._last_tx_packets, "vs. now:", tx_packets, "]) -> disabling Wi-Fi")
+                keep_checking = false
+                NetworkMgr:disableWifi()
+                -- NOTE: We leave wifi_was_on as-is on purpose, we wouldn't want to break auto_restore_wifi workflows on the next start...
+            end
         else
             logger.dbg("NetworkListener: Significant network activity (delta:", delta, "> threshold:", noise_threshold, "[ then:", NetworkListener._last_tx_packets, "vs. now:", tx_packets, "]) -> keeping Wi-Fi enabled")
         end
@@ -199,6 +206,21 @@ function NetworkListener:onNetworkDisconnected()
     NetworkListener:_unscheduleActivityCheck()
     -- Reset NetworkMgr's beforeWifiAction marker
     NetworkMgr:clearBeforeActionFlag()
+end
+
+-- A long-lived workflow may have allowed the activity-check backoff to reach
+-- its ceiling. Once its final lease is released, restart from a fresh traffic
+-- baseline so idle Wi-Fi is reconsidered after the normal timeout instead of
+-- potentially staying up for another half hour.
+function NetworkListener:onNetworkLeaseReleased()
+    logger.dbg("NetworkListener: onNetworkLeaseReleased")
+    if not G_reader_settings:isTrue("auto_disable_wifi")
+            or not NetworkMgr:getWifiState()
+            or not NetworkMgr:getNetworkInterfaceName() then
+        return
+    end
+    NetworkListener:_unscheduleActivityCheck()
+    NetworkListener:_scheduleActivityCheck()
 end
 
 -- Also unschedule on suspend (and we happen to also kill Wi-Fi to do so, so resetting the stats is also relevant here)

@@ -13,6 +13,9 @@ describe("remote document descriptors", function()
     local original_retain
     local original_strict
     local original_stats
+    local read_state_path
+    local original_read_state
+    local original_read_state_backup
     local util
     local created = {}
 
@@ -21,12 +24,13 @@ describe("remote document descriptors", function()
         return path
     end
 
-    local function create(extension, etag)
+    local function create(extension, etag, remote_path, server_id)
+        remote_path = remote_path or ("/Comics/A B." .. extension)
         return remember((RemoteDocument.create({
             provider = "webdav",
-            server_id = "11111111-2222-4333-8444-555555555555",
-            remote_path = "/Comics/A B." .. extension,
-            display_name = "A B." .. extension,
+            server_id = server_id or "11111111-2222-4333-8444-555555555555",
+            remote_path = remote_path,
+            display_name = remote_path:match("([^/]+)$"),
             size = 10 * 1024 * 1024,
             etag = etag or '"v1"',
             last_modified = "Wed, 15 Jul 2026 00:00:00 GMT",
@@ -44,6 +48,9 @@ describe("remote document descriptors", function()
         LuaSettings = require("luasettings")
         RemoteDocument = require("document/remotedocument")
         util = require("util")
+        read_state_path = RemoteDocument.getReadStatePath()
+        original_read_state = util.readFromFile(read_state_path, "rb")
+        original_read_state_backup = util.readFromFile(read_state_path .. ".old", "rb")
         cloud_settings = LuaSettings:open(DataStorage:getSettingsDir() .. "/cloudstorage.lua")
         original_servers = cloud_settings:readSetting("cs_servers")
         original_cache = cloud_settings:readSetting("webdav_stream_cache_mb")
@@ -63,6 +70,11 @@ describe("remote document descriptors", function()
         cloud_settings:flush()
     end)
 
+    before_each(function()
+        os.remove(read_state_path)
+        os.remove(read_state_path .. ".old")
+    end)
+
     teardown(function()
         for _, path in ipairs(created) do
             if RemoteDocument.isDescriptor(path) then RemoteDocument.forget(path) end
@@ -78,6 +90,14 @@ describe("remote document descriptors", function()
         restore("webdav_stream_strict", original_strict)
         restore("webdav_stream_show_stats", original_stats)
         cloud_settings:flush()
+        os.remove(read_state_path)
+        os.remove(read_state_path .. ".old")
+        if original_read_state then
+            assert(util.writeToFile(original_read_state, read_state_path, true))
+        end
+        if original_read_state_backup then
+            assert(util.writeToFile(original_read_state_backup, read_state_path .. ".old", true))
+        end
     end)
 
     it("normalizes paths and derives a stable server/path identity", function()
@@ -112,6 +132,103 @@ describe("remote document descriptors", function()
         assert.equals("Wed, 15 Jul 2026 00:00:00 GMT", last_modified)
     end)
 
+    it("persists normalized read state across module and settings reloads", function()
+        local server_id = "11111111-2222-4333-8444-555555555555"
+        assert.is_true(RemoteDocument.setReadState(
+            server_id, "//Comics/Old/../Book.cbz", true))
+
+        local persisted = LuaSettings:open(read_state_path):readSetting("read_items")
+        assert.is_table(persisted)
+        assert.equals(1, util.tableSize(persisted))
+
+        RemoteDocument = package.reload("document/remotedocument")
+        assert.is_true(RemoteDocument.isRead(server_id, "/Comics/Book.cbz"))
+
+        assert.is_true(RemoteDocument.setReadState(server_id, "/Comics/Book.cbz", false))
+        RemoteDocument = package.reload("document/remotedocument")
+        assert.is_false(RemoteDocument.isRead(server_id, "/Comics/Book.cbz"))
+        assert.is_false(RemoteDocument.getReadState(server_id, "/Comics/Book.cbz"))
+        assert.is_false(RemoteDocument.getReadStates(server_id)["/Comics/Book.cbz"])
+        assert.equals(1, util.tableSize(
+            LuaSettings:open(read_state_path):readSetting("read_items")))
+    end)
+
+    it("reports a read-state write that did not reach disk", function()
+        local original_flush = LuaSettings.flush
+        LuaSettings.flush = function(self) return self end
+        local ok, err = pcall(RemoteDocument.setReadState,
+            "11111111-2222-4333-8444-555555555555", "/Comics/Book.cbz", true)
+        LuaSettings.flush = original_flush
+
+        assert.is_false(ok)
+        assert.is_truthy(tostring(err):find("could not save WebDAV read state", 1, true))
+        assert.is_nil(RemoteDocument.getReadState(
+            "11111111-2222-4333-8444-555555555555", "/Comics/Book.cbz"))
+    end)
+
+    it("isolates read state by server and exact remote path", function()
+        local server_a = "11111111-2222-4333-8444-555555555555"
+        local server_b = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"
+        RemoteDocument.setReadState(server_a, "/Comics/Book.cbz", true)
+        RemoteDocument.setReadState(server_b, "/Comics/Other.cbz", true)
+
+        assert.is_true(RemoteDocument.isRead(server_a, "/Comics/Book.cbz"))
+        assert.is_false(RemoteDocument.isRead(server_b, "/Comics/Book.cbz"))
+        assert.is_nil(RemoteDocument.getReadState(server_b, "/Comics/Book.cbz"))
+        assert.is_false(RemoteDocument.isRead(server_a, "/Comics/Other.cbz"))
+        assert.is_nil(RemoteDocument.getReadState(server_a, "/Comics/Other.cbz"))
+        assert.is_true(RemoteDocument.isRead(server_b, "/Comics/Other.cbz"))
+        assert.is_false(RemoteDocument.isRead(server_a, "/Comics/Book.cbz.bak"))
+    end)
+
+    it("retains read state when unretained streaming progress is purged", function()
+        local server_id = "11111111-2222-4333-8444-555555555555"
+        local path = create("cbz", nil, "/Comics/Finished.cbz", server_id)
+        local settings = DocSettings:open(path)
+        settings:saveSetting("summary", { status = "complete" })
+        settings:flush()
+        RemoteDocument.setReadState(server_id, "/Comics/Finished.cbz", true)
+
+        local previous_retain = cloud_settings:readSetting("webdav_stream_retain_progress")
+        cloud_settings:saveSetting("webdav_stream_retain_progress", false)
+        local ok, err = pcall(RemoteDocument.cleanupUnretained, cloud_settings)
+        if previous_retain == nil then
+            cloud_settings:delSetting("webdav_stream_retain_progress")
+        else
+            cloud_settings:saveSetting("webdav_stream_retain_progress", previous_retain)
+        end
+        assert.is_true(ok, err)
+
+        assert.is_false(RemoteDocument.isDescriptor(path))
+        assert.is_true(RemoteDocument.isRead(server_id, "/Comics/Finished.cbz"))
+    end)
+
+    it("clears deleted read state without crossing path or server boundaries", function()
+        local server_a = "11111111-2222-4333-8444-555555555555"
+        local server_b = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"
+        for _, path in ipairs({
+            "/Delete/One.cbz",
+            "/Delete/Nested/Two.cbz",
+            "/Delete2/Keep.cbz",
+            "/Keep/Three.cbz",
+        }) do
+            RemoteDocument.setReadState(server_a, path, true)
+        end
+        RemoteDocument.setReadState(server_b, "/Delete/Other.cbz", true)
+
+        -- These entries deliberately have no descriptors: remote deletion must
+        -- still clean the durable read-state index before returning early.
+        assert.equals(0, RemoteDocument.forgetRemote(server_a, "/Delete/One.cbz"))
+        assert.is_nil(RemoteDocument.getReadState(server_a, "/Delete/One.cbz"))
+        assert.is_true(RemoteDocument.isRead(server_a, "/Delete/Nested/Two.cbz"))
+
+        assert.equals(0, RemoteDocument.forgetRemote(server_a, "/Delete", true))
+        assert.is_nil(RemoteDocument.getReadState(server_a, "/Delete/Nested/Two.cbz"))
+        assert.is_true(RemoteDocument.isRead(server_a, "/Delete2/Keep.cbz"))
+        assert.is_true(RemoteDocument.isRead(server_a, "/Keep/Three.cbz"))
+        assert.is_true(RemoteDocument.isRead(server_b, "/Delete/Other.cbz"))
+    end)
+
     it("recognizes canonical and historical relative descriptor paths", function()
         local path = create("cbz")
         local absolute = assert(ffiUtil.realpath(path))
@@ -142,6 +259,16 @@ describe("remote document descriptors", function()
         assert.equals(path, second_path)
         assert.equals(identity, RemoteDocument.getDescriptorIdentity(second_path))
         assert.equals('"v2"', RemoteDocument.load(second_path).etag)
+    end)
+
+    it("keeps remote page lookahead opt-in", function()
+        cloud_settings:delSetting("webdav_stream_lookahead")
+        cloud_settings:flush()
+        assert.equals(0, assert(RemoteDocument.resolve(create("cbz"))).lookahead)
+
+        cloud_settings:saveSetting("webdav_stream_lookahead", 1)
+        cloud_settings:flush()
+        assert.equals(1, assert(RemoteDocument.resolve(create("cbz"))).lookahead)
     end)
 
     it("resolves credentials in RAM and applies bounded settings", function()
@@ -211,6 +338,22 @@ describe("remote document descriptors", function()
         assert.is_true(RemoteDocument.forget(path))
         assert.is_nil(require("libs/libkoreader-lfs").attributes(path, "mode"))
         assert.is_nil(require("libs/libkoreader-lfs").attributes(sidecar, "mode"))
+    end)
+
+    it("forgets descriptors for a deleted remote file or collection", function()
+        local server_id = "11111111-2222-4333-8444-555555555555"
+        local other_server_id = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"
+        local deleted = create("cbz", nil, "/Delete/One.cbz", server_id)
+        local kept = create("cbz", nil, "/Keep/Two.cbz", server_id)
+        local other_server = create("cbz", nil, "/Delete/Other.cbz", other_server_id)
+
+        assert.equals(1, RemoteDocument.forgetRemote(server_id, "/Delete", true))
+        assert.is_false(RemoteDocument.isDescriptor(deleted))
+        assert.is_true(RemoteDocument.isDescriptor(kept))
+        assert.is_true(RemoteDocument.isDescriptor(other_server))
+
+        assert.equals(1, RemoteDocument.forgetRemote(other_server_id, "/Delete/Other.cbz"))
+        assert.is_false(RemoteDocument.isDescriptor(other_server))
     end)
 
     it("safely ignores malformed descriptors and removes stale zero-byte stubs", function()

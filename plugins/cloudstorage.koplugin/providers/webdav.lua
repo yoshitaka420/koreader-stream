@@ -1,4 +1,3 @@
-local DocumentRegistry = require("document/documentregistry")
 local RemoteDocument = require("document/remotedocument")
 local InfoMessage = require("ui/widget/infomessage")
 local MultiInputDialog = require("ui/widget/multiinputdialog")
@@ -11,6 +10,7 @@ local lfs = require("libs/libkoreader-lfs")
 local logger = require("logger")
 local ltn12 = require("ltn12")
 local socket = require("socket")
+local socket_url = require("socket.url")
 local socketutil = require("socketutil")
 local util = require("util")
 local _ = require("gettext")
@@ -22,6 +22,38 @@ local WebDav = {
 }
 
 local WebDavApi = {}
+
+local DELETE_RESPONSE_LIMIT = 64 * 1024
+
+local function getOrigin(url)
+    local parsed = socket_url.parse(url)
+    local scheme = parsed and parsed.scheme and parsed.scheme:lower()
+    local host = parsed and parsed.host and parsed.host:lower()
+    if (scheme ~= "http" and scheme ~= "https") or not host
+            or parsed.user or parsed.password then
+        return
+    end
+    local port = tonumber(parsed.port) or (scheme == "https" and 443 or 80)
+    return scheme, host, port
+end
+
+local function isSameOrigin(first_url, second_url)
+    local first_scheme, first_host, first_port = getOrigin(first_url)
+    local second_scheme, second_host, second_port = getOrigin(second_url)
+    return first_scheme ~= nil
+        and first_scheme == second_scheme
+        and first_host == second_host
+        and first_port == second_port
+end
+
+local function resolveSameOriginUrl(base_url, href)
+    if not href then return end
+    href = util.htmlEntitiesToUtf8(href)
+    local ok, resolved = pcall(socket_url.absolute, base_url, href)
+    if ok and resolved and isSameOrigin(base_url, resolved) then
+        return resolved
+    end
+end
 
 -- Trim leading & trailing slashes from string `s` (based on util.trim)
 function WebDavApi.trim_slashes(s)
@@ -94,18 +126,24 @@ function WebDavApi.listFolder(address, user, pass, folder_path, include_folders)
     local res = table.concat(sink)
     if res == "" then return end
 
-    local show_unsupported = G_reader_settings:isTrue("show_unsupported")
     local item_list = {}
     -- iterate through the <d:response> tags, each containing an entry
     for item in res:gmatch("<[^:]*:response[^>]*>(.-)</[^:]*:response>") do
         --logger.dbg("WebDav catalog item=", item)
         -- <d:href> is the path and filename of the entry.
-        local item_fullpath = util.urlDecode(item:match("<[^:]*:href[^>]*>(.*)</[^:]*:href>"))
+        local item_href = item:match("<[^:]*:href[^>]*>(.*)</[^:]*:href>")
+        local item_fullpath = util.urlDecode(item_href)
         local item_name = ffiUtil.basename(util.htmlEntitiesToUtf8(item_fullpath))
+        -- Keep the server-provided resource URI for state-changing requests.
+        -- Rebuilding it from the display name fails with aliases and servers
+        -- that canonicalize collection paths. Never retain a URI that would
+        -- send WebDAV credentials to another origin.
+        local dav_url = resolveSameOriginUrl(webdav_url, item_href)
         local is_not_collection = item:find("<[^:]*:resourcetype%s*/>") or
                                   item:find("<[^:]*:resourcetype>%s*</[^:]*:resourcetype>")
         if is_not_collection then
-            if show_unsupported or DocumentRegistry:hasProvider(item_name) then
+            local extension = (util.getFileNameSuffix(item_name) or ""):lower()
+            if extension == "cbz" or extension == "cbr" then
                 local file_size = tonumber(item:match("<[^:]*:getcontentlength[^>]*>(%d+)</[^:]*:getcontentlength>"))
                 local item_etag = item:match("<[^:]*:getetag[^>]*>(.-)</[^:]*:getetag>")
                 if item_etag then
@@ -124,6 +162,7 @@ function WebDavApi.listFolder(address, user, pass, folder_path, include_folders)
                     url = path .. "/" .. item_name,
                     filesize = file_size,
                     etag = item_etag,
+                    dav_url = dav_url,
                     modification = modification,
                     suffix = suffix,
                     mandatory = mandatory,
@@ -137,6 +176,7 @@ function WebDavApi.listFolder(address, user, pass, folder_path, include_folders)
                         is_folder = true,
                         text = item_name .. "/",
                         url = path .. "/" .. item_name,
+                        dav_url = dav_url,
                     })
                 end
             end
@@ -189,34 +229,96 @@ function WebDavApi.uploadFile(file_url, user, pass, local_path, etag)
     return code
 end
 
-function WebDavApi.deleteFile(file_url, user, pass)
-    socketutil:set_timeout(socketutil.FILE_BLOCK_TIMEOUT, socketutil.FILE_TOTAL_TIMEOUT)
-    local code, _, status = socket.skip(1, http.request{
-        url      = file_url,
-        method   = "DELETE",
-        user     = user,
-        password = pass,
-    })
-    socketutil:reset_timeout()
-    if type(code) == "number" and code >= 200 and code <= 299 then
-        return true
+local function getMultiStatusFailure(body)
+    local found
+    for code in body:gmatch("HTTP/%d+%.%d+%s+(%d%d%d)") do
+        found = true
+        code = tonumber(code)
+        if not code or code < 200 or code > 299 then return code or "invalid" end
     end
-    logger.warn("WebDavApi: cannot delete file:", status or code)
+    if not found then return "unparseable" end
 end
 
-function WebDavApi.createFolder(folder_url, user, pass)
+function WebDavApi.deleteItem(item_url, user, pass, is_folder)
+    if not getOrigin(item_url) then
+        return nil, "invalid WebDAV DELETE URL"
+    end
     socketutil:set_timeout(socketutil.FILE_BLOCK_TIMEOUT, socketutil.FILE_TOTAL_TIMEOUT)
-    local code, _, status = socket.skip(1, http.request{
-        url      = folder_url,
-        method   = "MKCOL",
-        user     = user,
-        password = pass,
-    })
+    local request_url = item_url
+    local code, headers, status, response_body, response_truncated
+    local request_ok, request_error = pcall(function()
+        for _ = 1, 4 do
+            local sink = {}
+            local response_size = 0
+            response_truncated = false
+            local function responseSink(chunk)
+                if chunk then
+                    local remaining = DELETE_RESPONSE_LIMIT - response_size
+                    if remaining > 0 then
+                        table.insert(sink, chunk:sub(1, remaining))
+                        response_size = response_size + math.min(#chunk, remaining)
+                    end
+                    if #chunk > remaining then response_truncated = true end
+                end
+                return 1
+            end
+            local request_headers = {
+                ["Content-Length"] = 0,
+            }
+            if is_folder then request_headers.Depth = "infinity" end
+            code, headers, status = socket.skip(1, http.request{
+                url      = request_url,
+                method   = "DELETE",
+                headers  = request_headers,
+                sink     = responseSink,
+                user     = user,
+                password = pass,
+            })
+            response_body = table.concat(sink)
+
+            if code ~= 301 and code ~= 302 and code ~= 307 and code ~= 308 then
+                return
+            end
+            local location = headers and (headers.location or headers.Location)
+            local redirected_url = location and socket_url.absolute(request_url, location)
+            if not redirected_url or not isSameOrigin(item_url, redirected_url) then
+                status = "refused unsafe WebDAV DELETE redirect"
+                code = nil
+                return
+            end
+            request_url = redirected_url
+        end
+        code = nil
+        status = "too many WebDAV DELETE redirects"
+    end)
     socketutil:reset_timeout()
+
+    if not request_ok then
+        logger.warn("WebDavApi: DELETE request failed:", request_error)
+        return nil, tostring(request_error)
+    end
+    -- DELETE is idempotent. A stale listing that now returns Not Found or Gone
+    -- has already reached the state the user requested.
+    if code == 404 or code == 410 then
+        return true, nil, true
+    end
     if type(code) == "number" and code >= 200 and code <= 299 then
+        if code == 207 then
+            local failed_code = response_truncated and "oversized"
+                or getMultiStatusFailure(response_body)
+            if failed_code then
+                local err = type(failed_code) == "number"
+                    and "WebDAV multi-status failure: HTTP " .. failed_code
+                    or "WebDAV multi-status failure: " .. failed_code .. " response"
+                logger.warn("WebDavApi: cannot delete item:", err)
+                return nil, err
+            end
+        end
         return true
     end
-    logger.warn("WebDavApi: cannot create folder:", status or code)
+    local err = status or code or "network unreachable"
+    logger.warn("WebDavApi: cannot delete item:", err)
+    return nil, tostring(err)
 end
 
 -- WebDav
@@ -264,20 +366,23 @@ function WebDav.uploadFile(url, local_path, etag)
     return WebDavApi.uploadFile(path, base.username, base.password, local_path, etag)
 end
 
-function WebDav.deleteFile(url)
+function WebDav.deleteItem(url, is_folder, dav_url)
     local base = WebDav.base
-    local path = WebDavApi.getJoinedPath(base.address, url)
-    -- ok
-    return WebDavApi.deleteFile(path, base.username, base.password)
+    local path = dav_url and resolveSameOriginUrl(base.address, dav_url)
+    if dav_url and not path then
+        return nil, "refused unsafe WebDAV resource URL"
+    end
+    path = path or WebDavApi.getJoinedPath(base.address, url)
+    if is_folder and path:sub(-1) ~= "/" then
+        path = path .. "/"
+    end
+    -- ok, error
+    return WebDavApi.deleteItem(path, base.username, base.password, is_folder)
 end
 
-function WebDav.createFolder(url, folder_name)
-    local base = WebDav.base
-    local path = WebDavApi.getJoinedPath(base.address, url)
-    path = WebDavApi.getJoinedPath(path, folder_name)
-    -- ok
-    return WebDavApi.createFolder(path, base.username, base.password)
-end
+-- Keep the provider API used by upstream callers while the focused UI uses
+-- the item-aware variant above for both files and WebDAV collections.
+WebDav.deleteFile = WebDav.deleteItem
 
 function WebDav.config(server_idx, caller_callback)
     local text_info = _([[Server address must be of the form http(s)://domain.name/path

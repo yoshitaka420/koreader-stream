@@ -112,10 +112,11 @@ function ReaderUI:registerPostReaderReadyCallback(callback)
     table.insert(self.postReaderReadyCallback, callback)
 end
 
--- This fork is a page-at-a-time WebDAV reader.  Apply these settings on every
--- open, after plugins have had a chance to load document settings, so an old
--- sidecar cannot restore continuous view or a cropped/width-only zoom mode.
+-- Apply the streaming policy after plugins load remote-document settings, so
+-- an old sidecar cannot restore continuous view or a cropped/width-only zoom
+-- mode. Local books keep KOReader's normal per-book display settings.
 function ReaderUI:enforceReaderViewDefaults()
+    if not self.document.is_remote then return end
     if self.document.info.has_pages then
         self.doc_settings:saveSetting("kopt_page_scroll", 0)
         self.doc_settings:saveSetting("kopt_zoom_mode_genus", 4) -- page
@@ -127,6 +128,30 @@ function ReaderUI:enforceReaderViewDefaults()
     else
         self.doc_settings:saveSetting("copt_view_mode", 0) -- page
     end
+end
+
+function ReaderUI:applyRemoteReadState(summary)
+    if not self.document.is_remote then return end
+    local source = self.document.remote_source
+    if not source or source.provider ~= "webdav"
+            or not source.server_id or not source.remote_path then
+        return
+    end
+    local ok, read_state = pcall(require("document/remotedocument").getReadState,
+        source.server_id, source.remote_path)
+    if not ok then
+        logger.warn("ReaderUI: could not load WebDAV read state:", read_state)
+        return
+    end
+    if read_state == nil then return end
+
+    local persisted_status = read_state and "complete" or "reading"
+    if summary.status ~= persisted_status then
+        summary.status = persisted_status
+        summary.modified = os.date("%Y-%m-%d", os.time())
+        BookList.setBookInfoCacheProperty(self.document.file, "status", persisted_status)
+    end
+    return read_state
 end
 
 function ReaderUI:init()
@@ -527,6 +552,7 @@ function ReaderUI:init()
         summary.status = "reading"
         summary.modified = os.date("%Y-%m-%d", os.time())
     end
+    self:applyRemoteReadState(summary)
 
     if summary.status ~= "complete" or not G_reader_settings:isTrue("history_freeze_finished_books") then
         require("readhistory"):addItem(file) -- (will update "lastfile")

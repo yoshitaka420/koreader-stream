@@ -81,9 +81,6 @@ describe("Readerpaging module", function()
                 document = DocumentRegistry:openDocument("spec/front/unit/data/djvu3spec.djvu"),
             }
             paging = readerui.paging
-            -- This fork resets every open to page view. Enter scroll mode
-            -- explicitly for the scroll-specific boundary tests below.
-            readerui:handleEvent(Event:new("SetScrollMode", true))
         end)
 
         teardown(function()

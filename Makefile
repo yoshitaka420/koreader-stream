@@ -83,9 +83,6 @@ endef
 define UPDATE_PATH_EXCLUDES +=
 data/cr3.ini
 defaults.*.lua
-frontend/apps/cloudstorage
-plugins/cloudstorage.koplugin/providers/dropbox.lua
-plugins/cloudstorage.koplugin/providers/ftp.lua
 history.lua
 scripts
 settings
@@ -159,7 +156,8 @@ endif
 	if test -n "$(filter kobo kobov4,$(TARGET))"; then \
 		rm -rf $(INSTALL_DIR)/koreader/plugins; \
 		install -d $(INSTALL_DIR)/koreader/plugins; \
-		$(SYMLINK) plugins/cloudstorage.koplugin $(INSTALL_DIR)/koreader/plugins/; \
+		$(SYMLINK) plugins/autodim.koplugin plugins/autosuspend.koplugin \
+			plugins/cloudstorage.koplugin $(INSTALL_DIR)/koreader/plugins/; \
 	else \
 		$(SYMLINK) plugins $(INSTALL_DIR)/koreader/; \
 	fi

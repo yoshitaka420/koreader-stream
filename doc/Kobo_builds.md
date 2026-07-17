@@ -108,18 +108,46 @@ back, exit KOReader and restore the backed-up `.adds/koreader` directory.
 ## Configure WebDAV streaming
 
 1. Enable Wi-Fi and launch KOReader Stream.
-2. Open **Cloud storage+**. On a fresh install it opens automatically.
+2. Open **WebDAV streaming**. On a fresh install it opens automatically.
 3. Tap the plus button, choose **WebDAV**, and enter a display name, an HTTPS
    WebDAV address, username, password, and optional start folder.
 4. Save the server, open it, and tap a `.cbz` or `.cbr` comic.
 5. While browsing the server, use the plus menu → **Streaming settings** to
-   choose the RAM cache, lookahead, strict CBR, progress, and statistics
-   options.
+   choose the RAM cache, lookahead, inactive-Wi-Fi behavior, strict CBR,
+   progress, and statistics options.
+6. A comic is marked read automatically when you reach its end. Read comics
+   show `✓ Read` in the list. Long-press a comic to choose **Mark as read** or
+   **Mark as unread**; this state survives restarts even when progress
+   retention is disabled.
+7. To delete a remote comic or collection, long-press it and choose
+   **Delete**. Deleting a collection also deletes its contents.
 
 The WebDAV service must support directory listing and exact HTTP byte-range
 responses (`206 Partial Content`). Use CBZ where possible. Solid CBR archives
 are not truly random-access; leave strict CBR streaming enabled to stop an
 unexpected near-complete transfer.
+
+WebDAV deletion is irreversible unless the server provides a trash or restore
+feature. The account must grant DELETE permission. KOReader follows only
+same-origin redirects for DELETE so credentials are never forwarded to a
+different server. Close a streamed book before deleting it or a parent
+collection.
+
+## Configure power saving
+
+- Remote page lookahead defaults to **Off (lower power)**. Increase it to 1 or
+  2 only if speculative downloads are worth the page-turn latency tradeoff.
+- **Disable Wi-Fi when inactive** is enabled on new Kobo profiles. The setting
+  takes effect after a restart. An open remote book intentionally keeps Wi-Fi
+  leased for reliable cache misses; close the reader or suspend the device
+  when taking a long break.
+- **Settings → Device → Autosuspend timeout** defaults to 15 minutes and is the
+  backstop for missed sleep-cover events. Full suspend turns Kobo Wi-Fi off.
+- **Settings → Screen → Automatic dimmer** is available but remains off until
+  enabled. It is useful when the frontlight is normally left on.
+- Leave autostandby disabled unless it has been validated on the exact Kobo
+  model. KOReader warns that standby is unreliable on some older boards, and
+  it cannot engage while Wi-Fi is on.
 
 ## Uninstall
 

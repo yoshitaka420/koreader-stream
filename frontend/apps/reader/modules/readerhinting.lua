@@ -1,4 +1,5 @@
 local EventListener = require("ui/widget/eventlistener")
+local CanvasContext = require("document/canvascontext")
 
 local DHINTCOUNT = G_defaults:readSetting("DHINTCOUNT")
 
@@ -15,12 +16,21 @@ function ReaderHinting:onHintPage()
     local hint_count = self.document.remote_source and self.document.remote_source.lookahead or DHINTCOUNT
     for i=1, hint_count do
         if self.view.state.page + i <= self.document.info.number_of_pages then
-            self.document:hintPage(
-                self.view.state.page + i,
-                self.zoom:getZoom(self.view.state.page + i),
-                self.view.state.rotation,
-                self.view.state.gamma,
-                self.view.state.saturation)
+            local ok, err = xpcall(function()
+                self.document:hintPage(
+                    self.view.state.page + i,
+                    self.zoom:getZoom(self.view.state.page + i),
+                    self.view.state.rotation,
+                    self.view.state.gamma,
+                    self.view.state.saturation)
+            end, debug.traceback)
+            if not ok then
+                -- Hinted rendering temporarily enables a second Kobo CPU core.
+                -- A remote I/O or decode error used to skip the matching
+                -- restore and could leave that core online for the session.
+                CanvasContext:enableCPUCores(1)
+                error(err, 0)
+            end
         end
     end
     return true

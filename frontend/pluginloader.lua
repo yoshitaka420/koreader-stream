@@ -23,6 +23,12 @@ local _ = require("gettext")
 
 local DEFAULT_PLUGIN_PATH = "plugins"
 
+local REQUIRED_PACKAGED_PLUGINS = {
+    "autodim",
+    "autosuspend",
+    "cloudstorage",
+}
+
 local BUILTIN_PLUGINS = {
     ["archiveviewer"] = true,
     ["autodim"] = true,
@@ -173,6 +179,19 @@ local PluginLoader = {
 
 function PluginLoader:_discover()
     local plugins_disabled = G_reader_settings:readSetting("plugins_disabled", {})
+    -- Recover required plugins from a setting carried over from a full
+    -- KOReader installation, because plugin management is intentionally not
+    -- exposed in the focused UI.
+    local recovered_required_plugin = false
+    for _, plugin_name in ipairs(REQUIRED_PACKAGED_PLUGINS) do
+        if plugins_disabled[plugin_name] then
+            plugins_disabled[plugin_name] = nil
+            recovered_required_plugin = true
+        end
+    end
+    if recovered_required_plugin then
+        G_reader_settings:saveSetting("plugins_disabled", plugins_disabled)
+    end
     local discovered = {}
     local lookup_path_list = { DEFAULT_PLUGIN_PATH }
     local extra_paths = G_reader_settings:readSetting("extra_plugin_paths")

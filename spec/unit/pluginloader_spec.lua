@@ -75,6 +75,45 @@ describe("PluginLoader module", function()
         assert.is_true(discovered[2].disabled)
     end)
 
+    it("recovers required packaged plugins from stale disabled settings", function()
+        local lfs_mock = require("libs/libkoreader-lfs")
+        lfs_mock.dir_results.plugins = {
+            ".",
+            "..",
+            "autodim.koplugin",
+            "autosuspend.koplugin",
+            "cloudstorage.koplugin",
+            "plugintwo.koplugin",
+        }
+        lfs_mock.attributes_results["plugins/autodim.koplugin"] = { mode = "directory" }
+        lfs_mock.attributes_results["plugins/autosuspend.koplugin"] = { mode = "directory" }
+        lfs_mock.attributes_results["plugins/cloudstorage.koplugin"] = { mode = "directory" }
+        lfs_mock.attributes_results["plugins/plugintwo.koplugin"] = { mode = "directory" }
+        G_reader_settings:saveSetting("plugins_disabled", {
+            autodim = true,
+            autosuspend = true,
+            cloudstorage = true,
+            plugintwo = true,
+        })
+
+        local discovered = PluginLoader:_discover()
+
+        assert.equals("autodim", discovered[1].name)
+        assert.is_false(discovered[1].disabled)
+        assert.equals("autosuspend", discovered[2].name)
+        assert.is_false(discovered[2].disabled)
+        assert.equals("cloudstorage", discovered[3].name)
+        assert.is_false(discovered[3].disabled)
+        assert.equals("plugintwo", discovered[4].name)
+        assert.is_true(discovered[4].disabled)
+
+        local plugins_disabled = G_reader_settings:readSetting("plugins_disabled")
+        assert.is_nil(plugins_disabled.autodim)
+        assert.is_nil(plugins_disabled.autosuspend)
+        assert.is_nil(plugins_disabled.cloudstorage)
+        assert.is_true(plugins_disabled.plugintwo)
+    end)
+
     it("normalizes the internal id for enabled plugins", function()
         stub(_G, "dofile", function(path)
             if path == "plugins/test.koplugin/main.lua" then

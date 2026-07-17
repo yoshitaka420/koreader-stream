@@ -7,11 +7,13 @@ describe("Version module", function()
     it("should get current revision", function()
         local rev = Version:getCurrentRevision()
         local year, month, point, revision = rev:match("v(%d%d%d%d)%.(%d%d)%.?(%d?)-?(%d*)") -- luacheck: ignore 211
+        local stream_major, stream_minor = rev:match("^stream%.v(%d+)%.(%d+)")
         local commit = rev:match("-%d*-g(%x*)[%d_%-]*") -- luacheck: ignore 211
-        assert.is_truthy(year)
-        assert.is_truthy(month)
-        assert.is_true(4 == year:len())
-        assert.is_true(2 == month:len())
+        assert.is_true((year and month) ~= nil or (stream_major and stream_minor) ~= nil)
+        if year then
+            assert.is_true(4 == year:len())
+            assert.is_true(2 == month:len())
+        end
     end)
     describe("normalized", function()
         it("should get current version", function()
@@ -65,6 +67,24 @@ describe("Version module", function()
             assert.are.same(expected_version, version)
             assert.are.same(expected_commit, commit)
         end)
+        it("should normalize a KOReader Stream release", function()
+            local version, commit = Version:getNormalizedVersion("stream.v0.1.0-2-g704d4238")
+            assert.are.same(900001000002, version)
+            assert.are.same("704d4238", commit)
+        end)
+    end)
+    it("should format KOReader Stream tags without assuming a date release", function()
+        local original_rev, original_short = Version.rev, Version.short
+        local cases = {
+            { "stream.v0.1.0", "stream.v0.1.0" },
+            { "stream.v0.1.0-2-g704d4238", "stream.v0.1.0-2" },
+        }
+        for _, case in ipairs(cases) do
+            Version.rev = case[1]
+            Version.short = nil
+            assert.equals(case[2], Version:getShortVersion())
+        end
+        Version.rev, Version.short = original_rev, original_short
     end)
     it("should fail gracefully", function()
         local version, commit = Version:getNormalizedVersion()

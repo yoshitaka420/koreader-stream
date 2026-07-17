@@ -51,6 +51,9 @@ function NetworkMgr:releaseNetworkLease(owner)
         self._network_leases[owner] = count - 1
     else
         self._network_leases[owner] = nil
+        if not self:hasNetworkLease() then
+            UIManager:broadcastEvent(Event:new("NetworkLeaseReleased"))
+        end
     end
 end
 
@@ -996,7 +999,10 @@ function NetworkMgr:getPowersaveMenuTable()
                     _([[This will automatically turn Wi-Fi off after a generous period of network inactivity, without disrupting workflows that require a network connection, so you can just keep reading without worrying about battery drain.]]),
         checked_func = function() return G_reader_settings:isTrue("auto_disable_wifi") end,
         callback = function()
-            G_reader_settings:flipNilOrFalse("auto_disable_wifi")
+            -- Keep an explicit false so focused-build first-run defaults do
+            -- not mistake the user's choice for an uninitialized setting.
+            G_reader_settings:saveSetting("auto_disable_wifi",
+                not G_reader_settings:isTrue("auto_disable_wifi"))
             -- NOTE: Well, not exactly, but the activity check wouldn't be (un)scheduled until the next Network(Dis)Connected event...
             UIManager:askForRestart()
         end,

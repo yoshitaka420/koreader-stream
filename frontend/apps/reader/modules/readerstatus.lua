@@ -5,6 +5,7 @@ local Device = require("device")
 local InfoMessage = require("ui/widget/infomessage")
 local UIManager = require("ui/uimanager")
 local WidgetContainer = require("ui/widget/container/widgetcontainer")
+local logger = require("logger")
 local util = require("util")
 local _ = require("gettext")
 
@@ -28,9 +29,27 @@ function ReaderStatus:onShowBookStatus(close_callback)
     local status_page = BookStatusWidget:new{
         ui = self.ui,
         close_callback = close_callback,
+        status_change_callback = function(status)
+            self:syncRemoteReadState(status == "complete")
+        end,
     }
     UIManager:show(status_page, "full")
     return true
+end
+
+function ReaderStatus:syncRemoteReadState(is_read)
+    local document = self.document
+    local source = document and document.is_remote and document.remote_source
+    if not source or source.provider ~= "webdav"
+            or type(source.server_id) ~= "string"
+            or type(source.remote_path) ~= "string" then
+        return
+    end
+    local ok, err = pcall(require("document/remotedocument").setReadState,
+        source.server_id, source.remote_path, is_read)
+    if not ok then
+        logger.warn("ReaderStatus: could not persist WebDAV read state:", err)
+    end
 end
 
 -- End of book
@@ -48,7 +67,8 @@ function ReaderStatus:onEndOfBook()
     end
 
     -- Should we start by marking the book as finished?
-    if G_reader_settings:isTrue("end_document_auto_mark") then
+    if (self.document and self.document.is_remote)
+            or G_reader_settings:isTrue("end_document_auto_mark") then
         self:markBook(true)
     end
 
@@ -214,6 +234,7 @@ function ReaderStatus:markBook(mark_read)
     summary.status = (not mark_read and summary.status == "complete") and "reading" or "complete"
     summary.modified = os.date("%Y-%m-%d", os.time())
     BookList.setBookInfoCacheProperty(self.document.file, "status", summary.status)
+    self:syncRemoteReadState(summary.status == "complete")
 end
 
 return ReaderStatus

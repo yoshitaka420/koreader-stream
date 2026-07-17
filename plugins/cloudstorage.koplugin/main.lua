@@ -1,4 +1,5 @@
 local DataStorage = require("datastorage")
+local Device = require("device")
 local Dispatcher = require("dispatcher")
 local InfoMessage = require("ui/widget/infomessage")
 local LuaSettings = require("luasettings")
@@ -6,14 +7,13 @@ local Notification = require("ui/widget/notification")
 local UIManager = require("ui/uimanager")
 local WidgetContainer = require("ui/widget/container/widgetcontainer")
 local ffiUtil = require("ffi/util")
-local filemanagerutil = require("apps/filemanager/filemanagerutil")
 local logger = require("logger")
 local util = require("util")
 local _ = require("gettext")
 
 local Cloud = WidgetContainer:extend{
     name = "cloudstorage",
-    title = _("Cloud storage+"),
+    title = _("WebDAV streaming"),
     settings_file = DataStorage:getSettingsDir() .. "/cloudstorage.lua",
     settings = nil,
     servers = nil, -- user servers (array)
@@ -22,41 +22,18 @@ local Cloud = WidgetContainer:extend{
 }
 
 function Cloud:init()
+    self:applyKoboPowerDefaults()
     self:getProviders()
     self:loadSettings()
     self:onDispatcherRegisterActions()
     self.ui.menu:registerToMainMenu(self)
-    self.ui.folder_shortcuts.registerShortcut({
-        provider = Cloud.name,
-        name = _("Cloud storage download folder"),
-        get = function()
-            self:loadSettings()
-            return self.settings:readSetting("download_dir") or G_reader_settings:readSetting("lastdir")
-        end,
-        set = function(path)
-            self.settings:saveSetting("download_dir", path)
-            self.updated = true
-        end,
-    })
-    self.ui.folder_shortcuts.registerShortcut({
-        provider = "cloudstorage_upload",
-        name = _("Cloud storage upload folder"),
-        get = function()
-            self:loadSettings()
-            return self.settings:readSetting("upload_dir") or filemanagerutil.getHomeFolder()
-        end,
-        set = function(path)
-            self.settings:saveSetting("upload_dir", path)
-            self.updated = true
-        end,
-    })
     -- This WebDAV-focused build opens Cloud storage on top of the File
     -- Manager as soon as startup has completed. Defer the action by one UI
     -- tick: FileManager runs post-init callbacks while it is still being
     -- constructed and is only placed on the widget stack afterwards.
-    -- ReaderUI also exposes registerPostInitCallback (and folder shortcuts),
-    -- so explicitly exclude document-backed UIs. Otherwise WebDAV is opened
-    -- over the freshly rendered book and looks like the reader crashed.
+    -- ReaderUI also exposes registerPostInitCallback, so explicitly exclude
+    -- document-backed UIs. Otherwise WebDAV is opened over the freshly
+    -- rendered book and looks like the reader crashed.
     if not self.ui.document then
         self.ui:registerPostInitCallback(function()
             UIManager:nextTick(function()
@@ -68,6 +45,15 @@ function Cloud:init()
     end
 end
 
+-- The focused Kobo build is network-heavy by design. Match upstream's power
+-- saving recommendation for new profiles, while preserving an explicit user
+-- choice carried over from an existing installation.
+function Cloud:applyKoboPowerDefaults()
+    if Device:isKobo() and G_reader_settings:hasNot("auto_disable_wifi") then
+        G_reader_settings:makeTrue("auto_disable_wifi")
+    end
+end
+
 function Cloud:getProviders()
     if not Cloud.providers then
         Cloud.providers = {}
@@ -75,7 +61,7 @@ function Cloud:getProviders()
         if ok and next(provider) and provider.name and provider.config and provider.run and provider.listFolder then
             Cloud.providers.webdav = provider
         else
-            logger.err("Cloud storage+: failed to load the WebDAV provider", provider)
+            logger.err("WebDAV streaming: failed to load the WebDAV provider", provider)
         end
     end
 end
@@ -136,21 +122,6 @@ function Cloud:onShowCloudStorageList(caller_choose_folder_callback, initial_ser
         -- external modules can call the plugin to choose the remote folder
         -- see CloudStorage:showFolderChooseDialog() for details of calling the callback
         caller_choose_folder_callback = caller_choose_folder_callback,
-        close_callback = function()
-            if not caller_choose_folder_callback then
-                if base.choose_folder_callback then
-                    -- keep open after choosing a remote folder for our "Sync folder"
-                    base:init(true)
-                    UIManager:show(base)
-                else
-                    local download_dir = self.settings:readSetting("download_dir") or G_reader_settings:readSetting("lastdir")
-                    local fc = self.ui.file_chooser
-                    if fc and fc.path == download_dir then
-                        fc:refreshPath()
-                    end
-                end
-            end
-        end,
     }
     for _, provider in pairs(self.providers) do
         provider.base = base
@@ -191,8 +162,8 @@ function Cloud.getReadablePath(server)
         url = util.stringStartsWith(url, "/") and url:sub(2) or url
         url = util.urlDecode(url) or url
         url = util.stringEndsWith(url, "/") and url or url .. "/"
-        url = server.type == "dropbox" and "/" .. url
-            or (server.address:sub(-1) == "/" and server.address or server.address .. "/") .. url
+        local address = server.address or ""
+        url = (address:sub(-1) == "/" and address or address .. "/") .. url
         url = url:sub(-2) == "//" and url:sub(1, -2) or url
     end
     return url
@@ -244,10 +215,7 @@ function Cloud:sync(server, file_path, sync_cb, is_silent, caller_pre_callback)
             while code_response == 412 do
                 os.remove(income_file_path)
                 code_response, etag = provider.downloadFile(server.url.."/"..file_name, income_file_path)
-                if code_response ~= 200 and code_response ~= 404
-                    and not (server.type == "dropbox" and code_response == 409)
-                    and not (server.type == "ftp" and code_response == 550)
-                then
+                if code_response ~= 200 and code_response ~= 404 then
                     show_msg()
                     return
                 end
@@ -257,7 +225,7 @@ function Cloud:sync(server, file_path, sync_cb, is_silent, caller_pre_callback)
                     if not ok then logger.err("sync service callback failed:", cb_return) end
                     return
                 end
-                code_response = provider.uploadFile(server.url, file_path, etag, true) or 412 -- FTP returns nil if failed
+                code_response = provider.uploadFile(server.url, file_path, etag, true) or 412
             end
             os.remove(income_file_path)
             if type(code_response) == "number" and code_response >= 200 and code_response < 300 then

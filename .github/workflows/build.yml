@@ -63,7 +63,11 @@ jobs:
         run: ./kodev test base webdav_range_stream
 
       - name: Run frontend streaming tests
-        run: ./kodev test -b front remotedocument remote_pdfdocument network_manager
+        run: >-
+          ./kodev test -b front
+          autosuspend cloudstorage_stream menusorter network_manager networklistener
+          pluginloader readerhighlight readerhinting readerpaging readerstatus_remote
+          readerui remotedocument remote_pdfdocument version webdav_delete
 
   build:
     name: Kobo firmware 4 package
@@ -131,10 +135,20 @@ jobs:
           grep -qx 'koreader/koreader.sh' tar-contents.txt
           grep -qx 'koreader/ota/package.index' tar-contents.txt
 
-          plugin_list="$({
-            sed -n 's#^.*koreader/plugins/\([^/]*\)/.*#\1#p' zip-contents.txt
-          } | sort -u)"
-          test "${plugin_list}" = "cloudstorage.koplugin"
+          expected_plugin_list="$(printf '%s\n' \
+            autodim.koplugin autosuspend.koplugin cloudstorage.koplugin)"
+          for contents in zip-contents.txt tar-contents.txt; do
+            plugin_list="$(sed -n 's#^.*koreader/plugins/\([^/]*\)/.*#\1#p' "${contents}" | sort -u)"
+            provider_list="$(sed -n \
+              's#^.*koreader/plugins/cloudstorage\.koplugin/providers/\(.*[^/]\)$#\1#p' \
+              "${contents}" | sort -u)"
+            test "${plugin_list}" = "${expected_plugin_list}"
+            test "${provider_list}" = "webdav.lua"
+            if grep -Eq '(^|/)frontend/apps/cloudstorage/' "${contents}"; then
+              echo "An unrelated cloud-storage implementation was packaged." >&2
+              exit 1
+            fi
+          done
 
           if grep -Eiq '(^|/)(\.env($|\.)|credentials?\.|secrets?\.|[^/]+\.(pem|p12|pfx|key)$)' \
               zip-contents.txt tar-contents.txt; then

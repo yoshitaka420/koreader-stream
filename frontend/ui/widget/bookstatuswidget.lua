@@ -194,10 +194,14 @@ function BookStatusWidget:genHeader(title)
 end
 
 function BookStatusWidget:onChangeBookStatus(option_name, option_value)
-    BookList.setBookInfoCacheProperty(self.ui.document.file, "status", option_name[option_value])
-    self.summary.status = option_name[option_value]
+    local status = option_name[option_value]
+    BookList.setBookInfoCacheProperty(self.ui.document.file, "status", status)
+    self.summary.status = status
     self.summary.modified = os.date("%Y-%m-%d", os.time())
     self.updated = true
+    if self.status_change_callback then
+        self.status_change_callback(status)
+    end
     return true
 end
 

@@ -33,7 +33,7 @@ describe("Readerui module", function()
         assert.are.same(0, readerui.document.configurable.view_mode)
         assert.are.same("page", readerui.view.view_mode)
     end)
-    it("should replace stale paged-document display settings on every open", function()
+    it("should replace stale paged-document display settings only for remote books", function()
         local fake_settings = {
             data = {
                 kopt_page_scroll = 1,
@@ -49,7 +49,7 @@ describe("Readerui module", function()
             end,
         }
         ReaderUI.enforceReaderViewDefaults{
-            document = { info = { has_pages = true } },
+            document = { is_remote = true, info = { has_pages = true } },
             doc_settings = fake_settings,
         }
 
@@ -60,6 +60,61 @@ describe("Readerui module", function()
         assert.are.same("page", fake_settings.data.normal_zoom_mode)
         assert.are.same("page", fake_settings.data.flipping_zoom_mode)
         assert.is_false(fake_settings.data.flipping_scroll_mode)
+
+        fake_settings.data.zoom_mode = "contentwidth"
+        ReaderUI.enforceReaderViewDefaults{
+            document = { info = { has_pages = true } },
+            doc_settings = fake_settings,
+        }
+        assert.are.same("contentwidth", fake_settings.data.zoom_mode)
+    end)
+    it("should restore explicit WebDAV read and unread states", function()
+        local BookList = require("ui/widget/booklist")
+        local RemoteDocument = require("document/remotedocument")
+        local original_set_status = BookList.setBookInfoCacheProperty
+        local original_get_read_state = RemoteDocument.getReadState
+        local persisted_state = false
+        local cached_statuses = {}
+        BookList.setBookInfoCacheProperty = function(file, key, value)
+            table.insert(cached_statuses, { file, key, value })
+        end
+        RemoteDocument.getReadState = function(server_id, remote_path)
+            assert.equals("server-id", server_id)
+            assert.equals("/Comics/Book.cbz", remote_path)
+            return persisted_state
+        end
+        local fake_reader = {
+            document = {
+                file = "/tmp/remote-read-state.cbz",
+                is_remote = true,
+                remote_source = {
+                    provider = "webdav",
+                    server_id = "server-id",
+                    remote_path = "/Comics/Book.cbz",
+                },
+            },
+        }
+        local summary = { status = "complete" }
+        local ok, err = pcall(function()
+            assert.is_false(ReaderUI.applyRemoteReadState(fake_reader, summary))
+            assert.equals("reading", summary.status)
+
+            persisted_state = true
+            assert.is_true(ReaderUI.applyRemoteReadState(fake_reader, summary))
+            assert.equals("complete", summary.status)
+
+            persisted_state = nil
+            summary.status = "abandoned"
+            assert.is_nil(ReaderUI.applyRemoteReadState(fake_reader, summary))
+            assert.equals("abandoned", summary.status)
+        end)
+        BookList.setBookInfoCacheProperty = original_set_status
+        RemoteDocument.getReadState = original_get_read_state
+        assert.is_true(ok, err)
+        assert.same({
+            { "/tmp/remote-read-state.cbz", "status", "reading" },
+            { "/tmp/remote-read-state.cbz", "status", "complete" },
+        }, cached_statuses)
     end)
     it("should show reader", function()
         UIManager:quit()

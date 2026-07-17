@@ -82,9 +82,12 @@ end)
 
 describe("NetworkMgr:hasLeaseForCurrentNetwork", function()
     local NetworkMgr
+    local UIManager
+    local broadcast_handlers
 
     setup(function()
         require("commonrequire")
+        UIManager = require("ui/uimanager")
         local Device = require("device")
         function Device:initNetworkManager(mgr)
             -- Minimal stubs so manager.lua initialises without errors.
@@ -98,6 +101,11 @@ describe("NetworkMgr:hasLeaseForCurrentNetwork", function()
     end)
 
     before_each(function()
+        broadcast_handlers = {}
+        stub(UIManager, "broadcastEvent")
+        UIManager.broadcastEvent.invokes(function(_, event)
+            table.insert(broadcast_handlers, event.handler)
+        end)
         package.loaded["ui/network/manager"] = nil
         G_reader_settings:saveSetting("wifi_was_on", false)
         NetworkMgr = require("ui/network/manager")
@@ -105,6 +113,7 @@ describe("NetworkMgr:hasLeaseForCurrentNetwork", function()
 
     after_each(function()
         package.loaded["ui/network/manager"] = nil
+        UIManager.broadcastEvent:revert()
     end)
 
     it("returns false when not connected", function()
@@ -148,8 +157,10 @@ describe("NetworkMgr:hasLeaseForCurrentNetwork", function()
         assert.is_true(NetworkMgr:hasNetworkLease())
         NetworkMgr:releaseNetworkLease("remote-document")
         assert.is_true(NetworkMgr:hasNetworkLease())
+        assert.equals(0, #broadcast_handlers)
         NetworkMgr:releaseNetworkLease("remote-document")
         assert.is_false(NetworkMgr:hasNetworkLease())
+        assert.same({ "onNetworkLeaseReleased" }, broadcast_handlers)
     end)
 
     it("tracks independent lease owners and tolerates an unknown release", function()
@@ -157,10 +168,36 @@ describe("NetworkMgr:hasLeaseForCurrentNetwork", function()
         NetworkMgr:acquireNetworkLease("sync")
         NetworkMgr:releaseNetworkLease("missing")
         assert.is_true(NetworkMgr:hasNetworkLease())
+        assert.equals(0, #broadcast_handlers)
         NetworkMgr:releaseNetworkLease("remote-document")
         assert.is_true(NetworkMgr:hasNetworkLease())
+        assert.equals(0, #broadcast_handlers)
         NetworkMgr:releaseNetworkLease("sync")
         assert.is_false(NetworkMgr:hasNetworkLease())
+        assert.same({ "onNetworkLeaseReleased" }, broadcast_handlers)
+    end)
+
+    it("persists an explicit inactive-Wi-Fi opt-out", function()
+        local had_setting = G_reader_settings:has("auto_disable_wifi")
+        local original_setting = G_reader_settings:readSetting("auto_disable_wifi")
+        local original_ask_for_restart = UIManager.askForRestart
+        local restart_requested
+        UIManager.askForRestart = function() restart_requested = true end
+        G_reader_settings:makeTrue("auto_disable_wifi")
+
+        local ok, err = pcall(function()
+            NetworkMgr:getPowersaveMenuTable().callback()
+            assert.is_true(restart_requested)
+            assert.is_true(G_reader_settings:isFalse("auto_disable_wifi"))
+        end)
+
+        UIManager.askForRestart = original_ask_for_restart
+        if had_setting then
+            G_reader_settings:saveSetting("auto_disable_wifi", original_setting)
+        else
+            G_reader_settings:delSetting("auto_disable_wifi")
+        end
+        assert.is_true(ok, err)
     end)
 
     teardown(function()

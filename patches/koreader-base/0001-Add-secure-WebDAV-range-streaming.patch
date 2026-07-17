@@ -1054,10 +1054,10 @@ index 00000000..2f42cf69
 + #endif
 diff --git a/webdav-range-stream.c b/webdav-range-stream.c
 new file mode 100644
-index 00000000..b474b40a
+index 00000000..c65524cc
 --- /dev/null
 +++ b/webdav-range-stream.c
-@@ -0,0 +1,867 @@
+@@ -0,0 +1,866 @@
 +#include "webdav-range-stream.h"
 +
 +#include <curl/curl.h>
@@ -1345,7 +1345,6 @@ index 00000000..b474b40a
 +    SETOPT(CURLOPT_TIMEOUT_MS, state->transfer_timeout_ms);
 +    SETOPT(CURLOPT_LOW_SPEED_LIMIT, 1L);
 +    SETOPT(CURLOPT_LOW_SPEED_TIME, 30L);
-+    SETOPT(CURLOPT_TCP_KEEPALIVE, 1L);
 +    SETOPT(CURLOPT_HTTPAUTH, (long)CURLAUTH_ANY);
 +    SETOPT(CURLOPT_USERNAME, state->username);
 +    SETOPT(CURLOPT_PASSWORD, state->password);

@@ -6,6 +6,14 @@ local VERSION_LOG_FILE = "version.log"
 
 local Version = {}
 
+local function parseStreamVersion(rev)
+    if not rev then return end
+    local major, minor, patch, revision = rev:match("stream%.v(%d+)%.(%d+)%.(%d+)%-?(%d*)")
+    if not major then return end
+    return tonumber(major), tonumber(minor), tonumber(patch), tonumber(revision),
+        rev:match("-%d*-g(%x*)[%d_%-]*")
+end
+
 --- Returns current KOReader git-rev.
 -- @treturn string full KOReader git-rev such as `v2015.11-982-g704d4238`
 function Version:getCurrentRevision()
@@ -29,6 +37,13 @@ end
 -- @treturn string short git commit version hash such as `704d4238`
 function Version:getNormalizedVersion(rev)
     if not rev then return end
+    local major, minor, patch, stream_revision, stream_commit = parseStreamVersion(rev)
+    if major then
+        -- Keep the 12-digit ordering contract used by the OTA code while
+        -- reserving a range that cannot collide with KOReader's date tags.
+        return ((9000 + major) * 100 + minor) * 1000000
+            + patch * 10000 + (stream_revision or 0), stream_commit
+    end
     local year, month, point, revision = rev:match("v(%d%d%d%d)%.(%d%d)%.?(%d?%d?)-?(%d*)")
 
     year = tonumber(year)
@@ -58,7 +73,14 @@ function Version:getShortVersion()
     if not self.short then
         local rev = self:getCurrentRevision()
         if (not rev or rev == "") then return "unknown" end
+        local major, minor, patch, stream_revision = parseStreamVersion(rev)
+        if major then
+            self.short = string.format("stream.v%d.%d.%d", major, minor, patch)
+            if stream_revision then self.short = self.short .. "-" .. stream_revision end
+            return self.short
+        end
         local year, month, point, revision = rev:match("v(%d%d%d%d)%.(%d%d)%.?(%d?%d?)-?(%d*)")
+        if not year then return rev end
         self.short = year .. "." .. month
         if point and point ~= "" then
             self.short = self.short .. "." .. point

@@ -2,19 +2,12 @@ local BD = require("ui/bidi")
 local BookList = require("ui/widget/booklist")
 local ButtonDialog = require("ui/widget/buttondialog")
 local ButtonSelector = require("ui/widget/buttonselector")
-local CheckButton = require("ui/widget/checkbutton")
 local ConfirmBox = require("ui/widget/confirmbox")
-local DocumentRegistry = require("document/documentregistry")
 local InfoMessage = require("ui/widget/infomessage")
-local InputDialog = require("ui/widget/inputdialog")
-local MultiConfirmBox = require("ui/widget/multiconfirmbox")
-local PathChooser = require("ui/widget/pathchooser")
-local ProgressbarDialog = require("ui/widget/progressbardialog")
 local SortWidget = require("ui/widget/sortwidget")
 local UIManager = require("ui/uimanager")
 local ffiUtil = require("ffi/util")
-local filemanagerutil = require("apps/filemanager/filemanagerutil")
-local lfs = require("libs/libkoreader-lfs")
+local logger = require("logger")
 local sort = require("sort")
 local util = require("util")
 local _ = require("gettext")
@@ -162,12 +155,49 @@ function CloudStorage:sortItemTable(tbl, url)
     end
 end
 
+function CloudStorage:decorateReadState(item, is_read)
+    if item.read_state_mandatory == nil then
+        -- false is a sentinel for rows without a file-size label.
+        item.read_state_mandatory = item.mandatory or false
+    end
+    item.is_read = is_read == true and true or nil
+    local original_mandatory = item.read_state_mandatory ~= false
+        and item.read_state_mandatory or nil
+    if item.is_read then
+        item.mandatory = original_mandatory
+            and T(_("✓ Read · %1"), original_mandatory) or _("✓ Read")
+        item.mandatory_dim = true
+    else
+        item.mandatory = original_mandatory
+        item.mandatory_dim = nil
+    end
+end
+
+function CloudStorage:applyReadStates(tbl, server)
+    if not server or server.type ~= "webdav" or not server.id then return end
+    local RemoteDocument = require("document/remotedocument")
+    local ok, states = pcall(RemoteDocument.getReadStates, server.id)
+    if not ok then
+        logger.warn("CloudStorage: could not load WebDAV read states:", states)
+        return
+    end
+    for _, item in ipairs(tbl) do
+        if item.is_file then
+            self:decorateReadState(item,
+                states[RemoteDocument.normalizePath(item.url)] == true)
+        end
+    end
+end
+
 function CloudStorage:show()
     local default_server_idx = self.initial_server_idx
         or self.settings:readSetting("default_server")
     self.initial_server_idx = nil
-    if default_server_idx and not self.servers[default_server_idx] then
-        default_server_idx = nil
+    if default_server_idx then
+        local server = self.servers[default_server_idx]
+        if not server or not self.providers[server.type] then
+            default_server_idx = nil
+        end
     end
     if default_server_idx then -- open default server
         self.server_idx = default_server_idx
@@ -188,10 +218,12 @@ function CloudStorage:openCloudServer(url, do_show)
     self.provider.run(function()
         local tbl = self.provider.listFolder(url, true) -- including folders
         if tbl then
+            self:applyReadStates(tbl, server)
             if self.remote_selected_files then
                 for _, item in ipairs(tbl) do
                     if self.remote_selected_files[item.url] then
                         item.dim = true
+                        self.remote_selected_files[item.url] = item
                     end
                 end
             else
@@ -216,6 +248,45 @@ function CloudStorage:openCloudServer(url, do_show)
             })
         end
     end)
+end
+
+function CloudStorage:setItemReadState(item, is_read)
+    local server = self.servers and self.servers[self.server_idx]
+    if not server or server.type ~= "webdav" or not server.id then
+        UIManager:show(InfoMessage:new{ text = _("Could not identify this WebDAV server.") })
+        return
+    end
+
+    local RemoteDocument = require("document/remotedocument")
+    local ok, err = pcall(RemoteDocument.setReadState, server.id, item.url, is_read)
+    if not ok then
+        UIManager:show(InfoMessage:new{
+            text = T(_("Could not update read status:\n%1"), tostring(err)),
+        })
+        return
+    end
+
+    self:decorateReadState(item, is_read)
+
+    -- Cloud storage may be opened over ReaderUI. Keep the active sidecar
+    -- status in lockstep so a later reader save cannot undo a manual choice.
+    if self:isActiveRemoteItem(item) then
+        local ui = self._manager and self._manager.ui
+        if ui and ui.doc_settings then
+            local summary = ui.doc_settings:readSetting("summary", {})
+            summary.status = is_read and "complete" or "reading"
+            summary.modified = os.date("%Y-%m-%d", os.time())
+            BookList.setBookInfoCacheProperty(ui.document.file, "status", summary.status)
+        end
+    end
+
+    self:updateItems(item.idx or 1, true)
+    UIManager:show(InfoMessage:new{
+        text = is_read and T(_("Marked as read:\n%1"), item.text)
+            or T(_("Marked as unread:\n%1"), item.text),
+        timeout = 2,
+    })
+    return true
 end
 
 function CloudStorage:onReturn()
@@ -256,14 +327,16 @@ function CloudStorage:onMenuSelect(item)
     elseif item.is_file and not self.choose_folder_callback then
         if self.remote_selected_files then
             item.dim = not item.dim and true or nil
-            self.remote_selected_files[item.url] = item.dim
+            self.remote_selected_files[item.url] = item.dim and item or nil
             self:updateItems(1, true)
         else
             local suffix = (item.suffix or util.getFileNameSuffix(item.text) or ""):lower()
             if self.provider.type == "webdav" and (suffix == "cbz" or suffix == "cbr") then
                 self:startStreaming(item)
             else
-                self:showFileDownloadDialog(item)
+                UIManager:show(InfoMessage:new{
+                    text = _("Only CBZ and CBR books can be streamed from WebDAV."),
+                })
             end
         end
     end
@@ -338,9 +411,80 @@ function CloudStorage:onMenuHold(item)
             else
                 self:showFileDialog(item)
             end
+        elseif item.is_folder then
+            self:showFolderDialog(item)
         end
     end
     return true
+end
+
+function CloudStorage:isActiveRemoteItem(item)
+    local ui = self._manager and self._manager.ui
+    local document = ui and ui.document
+    local source = document and document.is_remote and document.remote_source
+    local server = self.servers and self.servers[self.server_idx]
+    if not source or type(source.remote_path) ~= "string"
+            or not server or source.server_id ~= server.id then
+        return false
+    end
+
+    local RemoteDocument = require("document/remotedocument")
+    local active_path = RemoteDocument.normalizePath(source.remote_path)
+    local item_path = RemoteDocument.normalizePath(item.url)
+    if not item.is_folder then return active_path == item_path end
+    local descendant_prefix = item_path == "/" and "/" or item_path .. "/"
+    return active_path == item_path
+        or active_path:sub(1, #descendant_prefix) == descendant_prefix
+end
+
+function CloudStorage:forgetDeletedItem(item)
+    local server = self.servers[self.server_idx]
+    if not server or server.type ~= "webdav" or not server.id then return end
+    local ok, err = pcall(require("document/remotedocument").forgetRemote,
+        server.id, item.url, item.is_folder == true)
+    if not ok then
+        logger.warn("CloudStorage: could not forget deleted remote-book metadata:", err)
+    end
+end
+
+function CloudStorage:deleteRemoteItem(item)
+    if self:isActiveRemoteItem(item) then
+        return nil, _("Close this remote book before deleting it or its parent folder.")
+    end
+    local delete_item = self.provider.deleteItem or self.provider.deleteFile
+    if not delete_item then return nil, _("Deletion is not supported by this server.") end
+    local ok, err, already_absent = delete_item(item.url, item.is_folder == true, item.dav_url)
+    -- A 404/410 reaches the requested server state, but may be an
+    -- authentication-concealing response. Refresh the listing without
+    -- irreversibly purging local reading metadata in that case.
+    if ok and not already_absent then self:forgetDeletedItem(item) end
+    return ok, err, already_absent
+end
+
+function CloudStorage:deleteItem(item)
+    if self:isActiveRemoteItem(item) then
+        UIManager:show(InfoMessage:new{
+            text = _("Close this remote book before deleting it or its parent folder."),
+        })
+        return
+    end
+    local current_path = self.paths[#self.paths] and self.paths[#self.paths].url
+    self.provider.run(function()
+        local ok, err, already_absent = self:deleteRemoteItem(item)
+        if ok then
+            if current_path then self:openCloudServer(current_path) end
+            UIManager:show(InfoMessage:new{
+                text = already_absent
+                    and T(_("Already absent from WebDAV:\n%1"), item.text)
+                    or T(_("Deleted:\n%1"), item.text),
+                timeout = 2,
+            })
+        else
+            local text = T(_("Could not delete item:\n%1"), item.text)
+            if err and err ~= "" then text = text .. "\n" .. tostring(err) end
+            UIManager:show(InfoMessage:new{ text = text })
+        end
+    end)
 end
 
 function CloudStorage:showFolderChooseDialog(item)
@@ -391,6 +535,15 @@ function CloudStorage:showFileDialog(item)
         buttons = {
             {
                 {
+                    text = item.is_read and _("Mark as unread") or _("Mark as read"),
+                    callback = function()
+                        UIManager:close(file_dialog)
+                        self:setItemReadState(item, not item.is_read)
+                    end,
+                },
+            },
+            {
+                {
                     text = _("Delete"),
                     enabled = self.provider.deleteFile and true or false,
                     callback = function()
@@ -399,13 +552,7 @@ function CloudStorage:showFileDialog(item)
                             text = _("Delete this file?") .. "\n\n" .. item.text,
                             ok_text = _("Delete"),
                             ok_callback = function()
-                                local ok = self.provider.deleteFile(item.url)
-                                if ok then
-                                    table.remove(self.item_table, item.idx)
-                                    self:switchItemTable()
-                                else
-                                    UIManager:show(InfoMessage:new{ text = T(_("Could not delete file:\n%1"), item.text) })
-                                end
+                                self:deleteItem(item)
                             end,
                         })
                     end,
@@ -415,7 +562,7 @@ function CloudStorage:showFileDialog(item)
                     callback = function()
                         UIManager:close(file_dialog)
                         self:toggleSelectMode() -- turn on
-                        self.remote_selected_files[item.url] = true
+                        self.remote_selected_files[item.url] = item
                         self.item_table[item.idx].dim = true
                         self:updateItems(1, true)
                     end,
@@ -424,6 +571,33 @@ function CloudStorage:showFileDialog(item)
         },
     }
     UIManager:show(file_dialog)
+end
+
+function CloudStorage:showFolderDialog(item)
+    local folder_dialog
+    folder_dialog = ButtonDialog:new{
+        title = item.text,
+        title_align = "center",
+        buttons = {
+            {
+                {
+                    text = _("Delete folder"),
+                    enabled = (self.provider.deleteItem or self.provider.deleteFile) and true or false,
+                    callback = function()
+                        UIManager:close(folder_dialog)
+                        UIManager:show(ConfirmBox:new{
+                            text = _("Delete this folder and all of its contents?") .. "\n\n" .. item.text,
+                            ok_text = _("Delete"),
+                            ok_callback = function()
+                                self:deleteItem(item)
+                            end,
+                        })
+                    end,
+                },
+            },
+        },
+    }
+    UIManager:show(folder_dialog)
 end
 
 function CloudStorage:showSelectModeDialog()
@@ -442,14 +616,6 @@ function CloudStorage:showSelectModeDialog()
                     callback = function()
                         UIManager:close(select_dialog)
                         self:showSelectedFilesDeleteDialog()
-                    end,
-                },
-                {
-                    text = _("Download"),
-                    enabled = actions_enabled,
-                    callback = function()
-                        UIManager:close(select_dialog)
-                        self:showSelectedFilesDownloadDialog()
                     end,
                 },
             },
@@ -476,7 +642,7 @@ function CloudStorage:showSelectModeDialog()
                         for _, item in ipairs(self.item_table) do
                             if item.is_file then
                                 item.dim = true
-                                self.remote_selected_files[item.url] = true
+                                self.remote_selected_files[item.url] = item
                             end
                         end
                         self:updateItems(1, true)
@@ -566,27 +732,6 @@ function CloudStorage:showServerDialog(item)
             },
         },
     }
-    if provider.downloadFile and not self.caller_choose_folder_callback then
-        local server = self.servers[item.server_idx]
-        table.insert(buttons, {}) -- separator
-        table.insert(buttons, {
-            {
-                text = _("Sync now"),
-                enabled = server.sync_source_folder ~= nil and server.sync_dest_folder ~= nil,
-                callback = function()
-                    UIManager:close(server_dialog)
-                    self:syncCloud(item)
-                end,
-            },
-            {
-                text = _("Sync settings"),
-                callback = function()
-                    UIManager:close(server_dialog)
-                    self:showSyncSettingsDialog(item)
-                end,
-            },
-        })
-    end
     server_dialog = ButtonDialog:new{
         title = item.text,
         title_align = "center",
@@ -668,7 +813,8 @@ function CloudStorage:showStreamingSettingsDialog()
         self._manager.updated = true
     end
     local cache_mb = self.settings:readSetting("webdav_stream_cache_mb", 32)
-    local lookahead = self.settings:readSetting("webdav_stream_lookahead", 1)
+    local lookahead = self.settings:readSetting("webdav_stream_lookahead", 0)
+    local lookahead_label = lookahead == 0 and _("Off (lower power)") or tostring(lookahead)
     local retain = self.settings:nilOrTrue("webdav_stream_retain_progress")
     dialog = ButtonDialog:new{
         title = _("WebDAV comic streaming"),
@@ -694,7 +840,7 @@ function CloudStorage:showStreamingSettingsDialog()
             },
             {
                 {
-                    text = T(_("Page lookahead: %1"), lookahead),
+                    text = T(_("Page lookahead: %1"), lookahead_label),
                     callback = function()
                         UIManager:show(ButtonSelector:new{
                             current_value = lookahead,
@@ -706,6 +852,19 @@ function CloudStorage:showStreamingSettingsDialog()
                                 reopen()
                             end,
                         })
+                    end,
+                },
+            },
+            {
+                {
+                    text = _("Disable Wi-Fi when inactive"),
+                    checked_func = function() return G_reader_settings:isTrue("auto_disable_wifi") end,
+                    callback = function()
+                        G_reader_settings:saveSetting("auto_disable_wifi",
+                            not G_reader_settings:isTrue("auto_disable_wifi"))
+                        -- Match KOReader's network power-save control: the
+                        -- listener applies this when the UI restarts.
+                        UIManager:askForRestart()
                     end,
                 },
             },
@@ -750,39 +909,9 @@ function CloudStorage:showStreamingSettingsDialog()
 end
 
 function CloudStorage:showPlusCloudDialog()
-    local url = self.paths[#self.paths].url
     local plus_cloud_dialog
     plus_cloud_dialog = ButtonDialog:new{
         buttons = {
-            {
-                {
-                    text = _("New folder"),
-                    enabled = self.provider.createFolder and true or false,
-                    callback = function()
-                        UIManager:close(plus_cloud_dialog)
-                        self:showFolderCreateDialog(url)
-                    end,
-                },
-            },
-            {
-                {
-                    text = _("Upload selected files"),
-                    enabled = self.provider.uploadFile and not self.choose_folder_callback
-                        and self._manager.ui.selected_files ~= nil,
-                    callback = function()
-                        UIManager:close(plus_cloud_dialog)
-                        self:showSelectedFilesUploadDialog(url)
-                    end,
-                },
-                {
-                    text = _("Upload file"),
-                    enabled = self.provider.uploadFile and not self.choose_folder_callback,
-                    callback = function()
-                        UIManager:close(plus_cloud_dialog)
-                        self:showFileUploadDialog(url)
-                    end,
-                },
-            },
             {
                 {
                     text = _("Streaming settings"),
@@ -795,14 +924,6 @@ function CloudStorage:showPlusCloudDialog()
             },
             {}, -- separator
             {
-                {
-                    text = _("Info"),
-                    enabled = self.provider.info and true or false,
-                    callback = function()
-                        UIManager:close(plus_cloud_dialog)
-                        self.provider.info()
-                    end,
-                },
                 {
                     text = T(_("Sort by: %1"), self.collates[self.collate].text),
                     callback = function()
@@ -844,269 +965,6 @@ function CloudStorage:showPlusCloudDialog()
     UIManager:show(plus_cloud_dialog)
 end
 
-function CloudStorage:showFileDownloadDialog(item)
-    if self.provider.downloadFile == nil then return end
-    local function startDownloadFile(unit_item, local_path)
-        local progressbar_dialog = ProgressbarDialog:new{
-            title = _("Downloading…"),
-            subtitle = unit_item.text,
-            progress_max = unit_item.filesize,
-        }
-        UIManager:scheduleIn(1, function()
-            local progress_callback = function(progress)
-                progressbar_dialog:reportProgress(progress)
-            end
-            local code = self.provider.downloadFile(unit_item.url, local_path, progress_callback)
-            progressbar_dialog:close()
-            if code == 200 then
-                local text = T(_("File saved to:\n%1"), BD.filepath(local_path))
-                if DocumentRegistry:hasProvider(local_path) then
-                    UIManager:show(ConfirmBox:new{
-                        text = text .. "\n\n" .. _("Would you like to read the downloaded book now?"),
-                        ok_callback = function()
-                            self:onClose()
-                            filemanagerutil.openFile(self._manager.ui, local_path, nil, true)
-                        end,
-                    })
-                else
-                    UIManager:show(InfoMessage:new{ text = text })
-                end
-            else
-                UIManager:show(InfoMessage:new{ text = T(_("Could not save file to:\n%1"), BD.filepath(local_path)) })
-            end
-        end)
-        progressbar_dialog:show()
-    end
-
-    local function createTitle(filename_orig, filesize, filename, path) -- title for ButtonDialog
-        local filesize_str = filesize and util.getFriendlySize(filesize) or _("N/A")
-        return T(_("Filename:\n%1\n\nFile size:\n%2\n\nDownload filename:\n%3\n\nDownload folder:\n%4"),
-            filename_orig, filesize_str, filename, BD.dirpath(path))
-    end
-
-    local download_dir = self.settings:readSetting("download_dir") or G_reader_settings:readSetting("lastdir")
-    local filename_orig = item.text
-    local filename = filename_orig
-    local filesize = item.filesize
-
-    local download_dialog
-    local buttons = {
-        {
-            {
-                text = _("Choose folder"),
-                callback = function()
-                    UIManager:show(PathChooser:new{
-                        select_file = false,
-                        path = download_dir,
-                        onConfirm = function(path)
-                            self._manager.ui.folder_shortcuts:updateShortcut("cloudstorage", path)
-                            self.settings:saveSetting("download_dir", path)
-                            self._manager.updated = true
-                            download_dir = path
-                            download_dialog:setTitle(createTitle(filename_orig, filesize, filename, download_dir))
-                        end,
-                    })
-                end,
-            },
-            {
-                text = _("Change filename"),
-                callback = function()
-                    local input_dialog
-                    input_dialog = InputDialog:new{
-                        title = _("Enter filename"),
-                        input = filename,
-                        input_hint = filename_orig,
-                        buttons = {
-                            {
-                                {
-                                    text = _("Cancel"),
-                                    id = "close",
-                                    callback = function()
-                                        UIManager:close(input_dialog)
-                                    end,
-                                },
-                                {
-                                    text = _("Set filename"),
-                                    is_enter_default = true,
-                                    callback = function()
-                                        filename = input_dialog:getInputValue()
-                                        if filename == "" then
-                                            filename = filename_orig
-                                        end
-                                        UIManager:close(input_dialog)
-                                        download_dialog:setTitle(createTitle(filename_orig, filesize, filename, download_dir))
-                                    end,
-                                },
-                            }
-                        },
-                    }
-                    UIManager:show(input_dialog)
-                    input_dialog:onShowKeyboard()
-                end,
-            },
-        },
-        {
-            {
-                text = _("Cancel"),
-                callback = function()
-                    UIManager:close(download_dialog)
-                end,
-            },
-            {
-                text = _("Download"),
-                callback = function()
-                    UIManager:close(download_dialog)
-                    local local_path = (download_dir ~= "/" and download_dir or "") .. "/" .. filename
-                    local_path = util.fixUtf8(local_path, "_")
-                    if lfs.attributes(local_path) then
-                        UIManager:show(ConfirmBox:new{
-                            text = _("File already exists. Would you like to overwrite it?"),
-                            ok_callback = function()
-                                startDownloadFile(item, local_path)
-                            end,
-                        })
-                    else
-                        startDownloadFile(item, local_path)
-                    end
-                end,
-            },
-        },
-    }
-
-    download_dialog = ButtonDialog:new{
-        title = createTitle(filename_orig, filesize, filename, download_dir),
-        buttons = buttons,
-    }
-    UIManager:show(download_dialog)
-end
-
-function CloudStorage:showFileUploadDialog(url)
-    local old_path = self.settings:readSetting("upload_dir") or filemanagerutil.getHomeFolder()
-    UIManager:show(PathChooser:new{
-        select_directory = false,
-        path = old_path,
-        onConfirm = function(file_path)
-            local new_path = file_path:match("(.*)/")
-            if new_path == "" then new_path = "/" end
-            if new_path ~= old_path then
-                self._manager.ui.folder_shortcuts:updateShortcut("cloudstorage_upload", new_path)
-                self.settings:saveSetting("upload_dir", new_path)
-                self._manager.updated = true
-            end
-            if lfs.attributes(file_path, "size") > 157286400 then
-                UIManager:show(InfoMessage:new{ text = _("File size must be less than 150 MB.") })
-            else
-                UIManager:nextTick(function()
-                    UIManager:show(InfoMessage:new{
-                        text = _("Uploading…"),
-                        timeout = 1,
-                    })
-                end)
-                UIManager:tickAfterNext(function()
-                    local url_base = url ~= "/" and url or ""
-                    local code = self.provider.uploadFile(url_base, file_path)
-                    if code == 200 then
-                        self:openCloudServer(url)
-                        UIManager:show(InfoMessage:new{ text = T(_("File uploaded:\n%1"), BD.filepath(file_path)) })
-                    else
-                        UIManager:show(InfoMessage:new{ text = T(_("Could not upload file:\n%1"), BD.filepath(file_path)) })
-                    end
-                end)
-            end
-        end,
-    })
-end
-
-function CloudStorage:showSelectedFilesUploadDialog(url)
-    local files = self._manager.ui.selected_files
-    local files_nb = util.tableSize(files)
-    UIManager:show(ConfirmBox:new{
-        text = T(N_("Upload 1 file?", "Upload %1 files?", files_nb), files_nb),
-        ok_text = _("Upload"),
-        ok_callback = function()
-            local url_base = url ~= "/" and url or ""
-            local Trapper = require("ui/trapper")
-            Trapper:wrap(function()
-                Trapper:setPausedText("Upload paused.\nDo you want to continue or abort uploading files?")
-                local proccessed_files, success_files, unsuccess_files = 0, 0, 0
-                for file in pairs(files) do
-                    proccessed_files = proccessed_files + 1
-                    local text = string.format("Uploading file (%d/%d):\n%s", proccessed_files, files_nb, file:gsub(".*/", ""))
-                    if not Trapper:info(text) then
-                        break
-                    end
-                    local code = self.provider.uploadFile(url_base, file)
-                    if code == 200 then
-                        files[file] = nil
-                        success_files = success_files + 1
-                    else
-                        unsuccess_files = unsuccess_files + 1
-                    end
-                end
-                Trapper:clear()
-                if success_files > 0 then
-                    self:openCloudServer(url)
-                end
-                local text = T(N_("Uploaded 1 file.", "Uploaded %1 files.", success_files), success_files)
-                if unsuccess_files > 0 then
-                    text = text .. "\n" ..
-                        T(N_("Could not upload 1 file.", "Could not upload %1 files.", unsuccess_files), unsuccess_files)
-                end
-                UIManager:show(InfoMessage:new{ text = text })
-                if not next(files) then
-                    self._manager.ui:onToggleSelectMode()
-                end
-            end)
-        end,
-    })
-end
-
-function CloudStorage:showFolderCreateDialog(url)
-    local input_dialog, check_button_enter_folder
-    input_dialog = InputDialog:new{
-        title = _("New folder"),
-        buttons = {
-            {
-                {
-                    text = _("Cancel"),
-                    id = "close",
-                    callback = function()
-                        UIManager:close(input_dialog)
-                    end,
-                },
-                {
-                    text = _("Create"),
-                    is_enter_default = true,
-                    callback = function()
-                        local folder_name = input_dialog:getInputText()
-                        if folder_name == "" then return end
-                        UIManager:close(input_dialog)
-                        local url_base = url ~= "/" and url or ""
-                        local ok = self.provider.createFolder(url_base, folder_name)
-                        if ok then
-                            if check_button_enter_folder.checked then
-                                url = url_base .. "/" .. folder_name
-                                table.insert(self.paths, { url = url })
-                            end
-                            self:openCloudServer(url)
-                        else
-                            UIManager:show(InfoMessage:new{ text = T(_("Could not create folder:\n%1"), folder_name) })
-                        end
-                    end,
-                },
-            }
-        },
-    }
-    check_button_enter_folder = CheckButton:new{
-        text = _("Enter folder after creation"),
-        checked = false,
-        parent = input_dialog,
-    }
-    input_dialog:addWidget(check_button_enter_folder)
-    UIManager:show(input_dialog)
-    input_dialog:onShowKeyboard()
-end
-
 function CloudStorage:showSelectedFilesDeleteDialog()
     local files = self.remote_selected_files
     local files_nb = util.tableSize(files)
@@ -1114,222 +972,47 @@ function CloudStorage:showSelectedFilesDeleteDialog()
         text = T(N_("Delete 1 file?", "Delete %1 files?", files_nb), files_nb),
         ok_text = _("Delete"),
         ok_callback = function()
-            local Trapper = require("ui/trapper")
-            Trapper:wrap(function()
-                Trapper:setPausedText("Deleting paused.\nDo you want to continue or abort deleting files?")
-                local proccessed_files, success_files, unsuccess_files = 0, 0, 0
-                for file in pairs(files) do
-                    proccessed_files = proccessed_files + 1
-                    local text = string.format("Deleting file (%d/%d):\n%s", proccessed_files, files_nb, file:gsub(".*/", ""))
-                    if not Trapper:info(text) then
-                        break
-                    end
-                    local ok = self.provider.deleteFile(file)
-                    if ok then
-                        files[file] = nil
-                        success_files = success_files + 1
-                    else
-                        unsuccess_files = unsuccess_files + 1
-                    end
-                end
-                Trapper:clear()
-                if success_files > 0 then
-                    if not next(files) then
-                        self:toggleSelectMode() -- turn off
-                    end
-                    self:openCloudServer(self.paths[#self.paths].url)
-                end
-                local text = T(N_("Deleted 1 file.", "Deleted %1 files.", success_files), success_files)
-                if unsuccess_files > 0 then
-                    text = text .. "\n" ..
-                        T(N_("Could not delete 1 file.", "Could not delete %1 files.", unsuccess_files), unsuccess_files)
-                end
-                UIManager:show(InfoMessage:new{ text = text })
-            end)
-        end,
-    })
-end
-
-function CloudStorage:showSelectedFilesDownloadDialog()
-    local files = self.remote_selected_files
-    local files_nb = util.tableSize(files)
-    local download_dir = self.settings:readSetting("download_dir") or G_reader_settings:readSetting("lastdir")
-    local local_path = (download_dir ~= "/" and download_dir or "") .. "/"
-    UIManager:show(MultiConfirmBox:new{
-        text = T(N_("Download 1 file?", "Download %1 files?", files_nb), files_nb) .. "\n" ..
-            "\n" .. _("Download folder:") .. "\n" .. download_dir ..
-            "\n" .. _("Existing files will be overwritten."),
-        choice1_text = _("Choose folder"),
-        choice1_callback = function()
-            UIManager:show(PathChooser:new{
-                select_file = false,
-                path = download_dir,
-                onConfirm = function(path)
-                    self._manager.ui.folder_shortcuts:updateShortcut("cloudstorage", path)
-                    self.settings:saveSetting("download_dir", path)
-                    self._manager.updated = true
-                    download_dir = path
-                    self:showSelectedFilesDownloadDialog()
-                end,
-            })
-        end,
-        choice2_text = _("Download"),
-        choice2_callback = function()
-            local Trapper = require("ui/trapper")
-            Trapper:wrap(function()
-                Trapper:setPausedText("Downloading paused.\nDo you want to continue or abort downloading files?")
-                local proccessed_files, success_files, unsuccess_files = 0, 0, 0
-                for file in pairs(files) do
-                    proccessed_files = proccessed_files + 1
-                    local file_name = file:gsub(".*/", "")
-                    local text = string.format("Downloading file (%d/%d):\n%s", proccessed_files, files_nb, file_name)
-                    if not Trapper:info(text) then
-                        break
-                    end
-                    local code = self.provider.downloadFile(file, local_path .. file_name)
-                    if code == 200 then
-                        files[file] = nil
-                        success_files = success_files + 1
-                    else
-                        unsuccess_files = unsuccess_files + 1
-                    end
-                end
-                Trapper:clear()
-                if success_files > 0 then
-                    if not next(files) then
-                        self:toggleSelectMode() -- turn off
-                    end
-                    self:openCloudServer(self.paths[#self.paths].url)
-                end
-                local text = T(N_("Downloaded 1 file.", "Downloaded %1 files.", success_files), success_files)
-                if unsuccess_files > 0 then
-                    text = text .. "\n" ..
-                        T(N_("Could not download 1 file.", "Could not download %1 files.", unsuccess_files), unsuccess_files)
-                end
-                UIManager:show(InfoMessage:new{ text = text })
-            end)
-        end,
-    })
-end
-
-function CloudStorage:showSyncSettingsDialog(item)
-    local server = self.servers[item.server_idx]
-    local sync_source_folder = server.sync_source_folder == "" and "/" or server.sync_source_folder
-    local sync_dialog
-    sync_dialog = ButtonDialog:new{
-        title = server.name .. "\n\n" .. T(_("Remote (source) folder:\n%1\nLocal (destination) folder:\n%2"),
-            sync_source_folder and BD.dirpath(sync_source_folder) or _("not set"),
-            server.sync_dest_folder and BD.dirpath(server.sync_dest_folder) or _("not set")),
-        title_align = "center",
-        buttons = {
-            {
-                {
-                    text = _("Choose remote folder"),
-                    callback = function()
-                        UIManager:close(sync_dialog)
-                        self.choose_folder_callback = function(path)
-                            server.sync_source_folder = path
-                            self._manager.updated = true
-                            self:showSyncSettingsDialog(item)
+            self.provider.run(function()
+                local Trapper = require("ui/trapper")
+                Trapper:wrap(function()
+                    Trapper:setPausedText("Deleting paused.\nDo you want to continue or abort deleting files?")
+                    local proccessed_files, success_files, unsuccess_files = 0, 0, 0
+                    for file, selected_item in pairs(files) do
+                        proccessed_files = proccessed_files + 1
+                        local text = string.format("Deleting file (%d/%d):\n%s", proccessed_files, files_nb, file:gsub(".*/", ""))
+                        if not Trapper:info(text) then
+                            break
                         end
-                        table.insert(self.paths, { url = item.url })
-                        self.item_idx = item.idx
-                        self.server_idx = item.server_idx
-                        self:openCloudServer()
-                    end,
-                },
-            },
-            {
-                {
-                    text = _("Choose local folder"),
-                    callback = function()
-                        UIManager:close(sync_dialog)
-                        UIManager:show(PathChooser:new{
-                            select_file = false,
-                            path = server.sync_dest_folder,
-                            onConfirm = function(path)
-                                server.sync_dest_folder = path
-                                self._manager.updated = true
-                                self:showSyncSettingsDialog(item)
-                            end,
-                        })
-                    end,
-                },
-            },
-        },
-    }
-    UIManager:show(sync_dialog)
-end
-
-function CloudStorage:syncCloud(item)
-    local server = self:initServer(item.server_idx)
-    self.provider.run(function()
-        local Trapper = require("ui/trapper")
-        Trapper:wrap(function()
-            Trapper:setPausedText("Download paused.\nDo you want to continue or abort downloading files?")
-            Trapper:info(_("Retrieving files…"))
-            local url = server.sync_source_folder == "/" and "" or server.sync_source_folder
-            local remote_files = self.provider.listFolder(url) -- excluding folders
-            if not remote_files then
-                Trapper:clear()
-                UIManager:show(InfoMessage:new{
-                    text = T(_("Server: %1"), server.name) .. "\n" ..
-                        _("Could not fetch server's content.\nPlease check your configuration or network connection."),
-                })
-                return
-            end
-
-            local local_files = {}
-            local path = server.sync_dest_folder
-            local ok, iter, dir_obj = pcall(lfs.dir, path)
-            if ok then
-                for f in iter, dir_obj do
-                    local filename = path .."/" .. f
-                    local attributes = lfs.attributes(filename)
-                    if attributes.mode == "file" then
-                        local_files[f] = attributes.size
+                        local deletion_item = type(selected_item) == "table" and selected_item or {
+                            is_file = true,
+                            text = file:gsub(".*/", ""),
+                            url = file,
+                        }
+                        local ok = self:deleteRemoteItem(deletion_item)
+                        if ok then
+                            files[file] = nil
+                            success_files = success_files + 1
+                        else
+                            unsuccess_files = unsuccess_files + 1
+                        end
                     end
-                end
-            end
-
-            local files_to_download = 0
-            for i, file in ipairs(remote_files) do
-                if not local_files[file.text] or local_files[file.text] ~= file.filesize then
-                    files_to_download = files_to_download + 1
-                    remote_files[i].download = true
-                end
-            end
-            if files_to_download == 0 then
-                Trapper:clear()
-                UIManager:show(InfoMessage:new{ text = _("No files to download.") })
-                return
-            end
-
-            local proccessed_files, success_files, unsuccess_files = 0, 0, 0
-            for _, file in ipairs(remote_files) do
-                if file.download then
-                    proccessed_files = proccessed_files + 1
-                    local text = string.format("Downloading file (%d/%d):\n%s", proccessed_files, files_to_download, file.text)
-                    if not Trapper:info(text) then
-                        break
+                    Trapper:clear()
+                    if success_files > 0 then
+                        if not next(files) then
+                            self:toggleSelectMode() -- turn off
+                        end
+                        self:openCloudServer(self.paths[#self.paths].url)
                     end
-                    local code = self.provider.downloadFile(file.url, server.sync_dest_folder .. "/" .. file.text)
-                    if code == 200 then
-                        success_files = success_files + 1
-                    else
-                        unsuccess_files = unsuccess_files + 1
+                    local text = T(N_("Deleted 1 file.", "Deleted %1 files.", success_files), success_files)
+                    if unsuccess_files > 0 then
+                        text = text .. "\n" ..
+                            T(N_("Could not delete 1 file.", "Could not delete %1 files.", unsuccess_files), unsuccess_files)
                     end
-                end
-            end
-            Trapper:clear()
-            local text = T(N_("Downloaded 1 file.", "Downloaded %1 files.", success_files), success_files)
-            if unsuccess_files > 0 then
-                text = text .. "\n" ..
-                    T(N_("Could not download 1 file.", "Could not download %1 files.", unsuccess_files), unsuccess_files)
-            end
-            UIManager:show(InfoMessage:new{ text = text })
-        end)
-    end)
+                    UIManager:show(InfoMessage:new{ text = text })
+                end)
+            end)
+        end,
+    })
 end
 
 return CloudStorage

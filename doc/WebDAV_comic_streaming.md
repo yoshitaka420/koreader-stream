@@ -135,24 +135,53 @@ directory command-line launches remain available for recovery. The startup
 callback is registered only on FileManager; ReaderUI must never reopen the
 WebDAV browser over a book that has just finished rendering.
 
-Every document open overrides stale per-book display settings before they are
-read. Paged documents start in page view with full-page fit; reflowable
-documents start in page view as well. The user can still change the view while
-the book is open, but a later open reapplies the reader policy.
+Every remote-document open overrides stale per-book display settings before
+they are read. Streamed paged documents start in page view with full-page fit;
+streamed reflowable documents start in page view as well. Local books retain
+normal KOReader per-book settings. The user can still change the view while a
+remote book is open, but a later open reapplies the streaming policy.
 
-Kobo release packages use a strict feature allowlist. Cloud Storage+ is the
-only installed plugin and WebDAV is its only provider. The legacy Cloud
-Storage application is omitted. The Tools menu contains only Cloud Storage+;
-text editor, news downloader, Wallabag, move-to-archive, archive viewer, OPDS,
-terminal, synchronization, statistics, and other auxiliary plugins and search
-tools are neither packaged nor exposed. Essential reading/navigation,
-progress and history, display and network settings, USB storage, exit, and
-recovery paths remain.
+Long-pressing a remote file or folder exposes an explicit delete action.
+DELETE requests use the resource URI returned by WebDAV, carry a zero content
+length, wait for connectivity through KOReader's normal network guard, and
+follow only bounded same-origin redirects. A server-confirmed deletion removes
+matching local descriptors and progress metadata; collection deletion cleans
+descriptors for descendants as well. An already-absent response refreshes the
+listing but conservatively retains local reading metadata. A malformed or
+partly failed `207 Multi-Status` remains an error instead of being mistaken for
+success. KOReader also blocks deletion of the currently open remote book or
+one of its parent collections until that book is closed.
+
+Reaching the end of a streamed book automatically marks that WebDAV resource
+as read, independently of the local-book auto-mark preference. Read books show
+`✓ Read` beside their size in the WebDAV browser. Long-pressing a file also
+offers **Mark as read** or **Mark as unread**, and the normal reader book-status
+control stays synchronized with the same state. The registry is keyed by the
+stable server UUID and normalized remote path, flushed immediately to a
+dedicated settings file, and therefore survives restarts and descriptor or
+sidecar cleanup. A confirmed file or collection deletion removes the matching
+read-state records; an ambiguous already-absent response retains them.
+
+The packaged browser intentionally lists CBZ/CBR resources and collections
+only. Generic cloud downloads, uploads, collection creation, and folder-sync
+controls are removed from the focused streaming UI.
+
+Kobo release packages use a strict feature allowlist. WebDAV streaming is the
+only installed content/network plugin and WebDAV is its only provider. The
+power-relevant Auto power save and Automatic dimmer plugins are also packaged.
+The legacy Cloud Storage application is omitted. The Tools menu contains only
+WebDAV streaming; text editor, news downloader, Wallabag, move-to-archive,
+archive viewer, OPDS, terminal, synchronization, statistics, and other
+auxiliary plugins and search tools are neither packaged nor exposed. Essential
+reading/navigation, progress and history, display and network settings, USB
+storage, exit, recovery, suspend, and frontlight controls remain.
 
 Streaming settings include:
 
 - RAM block-cache size;
-- page lookahead of 0, 1, or 2;
+- page lookahead of 0, 1, or 2 (off by default to avoid speculative radio,
+  decode, and render work);
+- inactive Wi-Fi shutdown (enabled for new Kobo profiles);
 - strict CBR streaming (enabled by default);
 - retain progress versus forget on close;
 - per-book request, byte, opening, peak-cache, and retry statistics.
@@ -161,6 +190,24 @@ A reference-counted network lease prevents inactivity-based Wi-Fi shutdown
 while a remote book is open. Manual shutdown and suspend remain authoritative.
 On resume, KOReader restores Wi-Fi when it had been active; a failed block can
 be requested again without reopening the document.
+
+The native range client leaves TCP keepalive disabled, so an idle reusable HTTP
+connection does not generate periodic probes. Its bounded retry path opens a
+fresh connection when a server or NAT has discarded an idle socket. When the
+final network lease is released, the activity monitor resets its adaptive
+backoff and begins again at the normal short interval instead of potentially
+leaving Wi-Fi up for the previous 30-minute ceiling.
+
+Hinted rendering is guarded so a WebDAV or decode exception always restores
+Kobo's normal single online CPU core. The second core is still used briefly
+during explicitly enabled hints; removing that race-to-idle optimization would
+require measurements on the target hardware.
+
+The focused package retains KOReader's 15-minute autosuspend default and makes
+its opt-in Automatic dimmer available. It does not silently enable autostandby:
+standby is blocked while Wi-Fi is active and is known to be unreliable on some
+Kobo boards. Full suspend remains the reliable long-idle path and powers Wi-Fi
+down even when a remote document lease is active.
 
 ## Automated validation
 
@@ -175,7 +222,10 @@ From the repository root:
 ./kodev build
 ./kodev check
 ./kodev test -b base webdav_range_stream
-./kodev test -b front remotedocument remote_pdfdocument network_manager
+./kodev test -b front autosuspend cloudstorage_stream menusorter network_manager \
+    networklistener pluginloader readerhighlight readerhinting readerpaging \
+    readerstatus_remote readerui remotedocument remote_pdfdocument version \
+    webdav_delete
 ./kodev test -b all
 ```
 
