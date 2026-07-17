@@ -32,8 +32,9 @@ Source inspection and executable tests required these changes:
    into a generic archive error or a blank page. The binding checks the remote
    stream after archive open and every page load so authentication, changed
    file, network, and strict-limit failures remain visible.
-4. LRU eviction happens before allocating an incoming block. Consequently the
-   block buffers never transiently exceed the configured ceiling.
+4. LRU eviction happens before an incoming block is fetched. Full-size evicted
+   buffers are recycled in place, avoiding repeated allocation and secure-zero
+   writes while the cache is warm; final close and error paths still wipe them.
 5. Metadata identity is the MD5 of `server UUID + NUL + normalized remote
    path`, not a hash of descriptor contents. Progress therefore survives ETag
    updates.
@@ -59,7 +60,7 @@ Source inspection and executable tests required these changes:
 
 ```text
 Cloud Storage selection
-  -> bounded GET bytes=0-0 probe
+  -> bounded GET bytes=0-0 probe (retained native stream/connection)
   -> non-secret remote descriptor
   -> DocumentRegistry / PdfDocument
   -> libcurl-backed seekable fz_stream
@@ -123,10 +124,12 @@ and forgotten books.
 ## UI and power behavior
 
 Tapping a WebDAV `.cbz` or `.cbr` streams it immediately. KOReader checks
-Wi-Fi, performs the native probe, persists a stable server UUID, creates the
+Wi-Fi, performs the native probe, transfers that same libcurl stream into the
+reader, persists a stable server UUID, creates the
 descriptor, closes Cloud Storage, and opens ReaderUI without an action or
 validator-confirmation dialog. Normal reader controls and recovery paths stay
-available, but the alternate tap-to-download comic flow is removed.
+available, but the alternate tap-to-download comic flow is removed. Servers
+without a usable PROPFIND size retain the legacy probe-then-open fallback.
 
 On a normal KOReader launch, FileManager is created as a recovery layer and
 the first configured WebDAV server is opened over it on the next UI tick.
@@ -195,16 +198,22 @@ The native range client leaves TCP keepalive disabled, so an idle reusable HTTP
 connection does not generate periodic probes. Its bounded retry path opens a
 fresh connection when a server or NAT has discarded an idle socket. When the
 final network lease is released, the activity monitor resets its adaptive
-backoff and begins again at the normal short interval instead of potentially
-leaving Wi-Fi up for the previous 30-minute ceiling.
+backoff and performs a one-shot idle check after 60 seconds instead of
+potentially leaving Wi-Fi up for the previous 30-minute ceiling. Kobo Wi-Fi
+restore checks back off from 250 ms to two seconds while preserving their
+original 15- and 45-second deadlines.
+
+Reopening an unchanged remote descriptor skips its flash rewrite and fsync.
+Cloud settings are likewise flushed only for a new server UUID or pending
+edits, rather than on every book open.
 
 Hinted rendering is guarded so a WebDAV or decode exception always restores
 Kobo's normal single online CPU core. The second core is still used briefly
 during explicitly enabled hints; removing that race-to-idle optimization would
 require measurements on the target hardware.
 
-The focused package retains KOReader's 15-minute autosuspend default and makes
-its opt-in Automatic dimmer available. It does not silently enable autostandby:
+The focused package uses a five-minute autosuspend default and dims the
+frontlight after two idle minutes. It does not silently enable autostandby:
 standby is blocked while Wi-Fi is active and is known to be unreliable on some
 Kobo boards. Full suspend remains the reliable long-idle path and powers Wi-Fi
 down even when a remote document lease is active.

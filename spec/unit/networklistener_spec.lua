@@ -52,6 +52,7 @@ describe("NetworkListener network lease release", function()
         NetworkListener._activity_check_scheduled = true
         NetworkListener._last_tx_packets = 7
         NetworkListener._activity_check_delay_seconds = 30 * 60
+        NetworkListener._released_lease_recheck = nil
     end)
 
     after_each(function()
@@ -69,16 +70,29 @@ describe("NetworkListener network lease release", function()
         restoreSetting("auto_standby_timeout_seconds", original_auto_standby)
     end)
 
-    it("restarts the activity check from a fresh baseline and normal delay", function()
+    it("restarts the activity check from a fresh baseline after one minute", function()
         NetworkListener:onNetworkLeaseReleased()
 
         assert.stub(UIManager.unschedule).was.called_with(
             UIManager, NetworkListener._scheduleActivityCheck)
         assert.equals(42, NetworkListener._last_tx_packets)
-        assert.equals(5 * 60, NetworkListener._activity_check_delay_seconds)
-        assert.equals(5 * 60, scheduled_delay)
+        assert.equals(60, NetworkListener._activity_check_delay_seconds)
+        assert.equals(60, scheduled_delay)
         assert.equals(NetworkListener._scheduleActivityCheck, scheduled_callback)
         assert.is_true(NetworkListener._activity_check_scheduled)
+        assert.is_true(NetworkListener._released_lease_recheck)
+    end)
+
+    it("returns to the normal cadence after the one-minute recheck", function()
+        NetworkListener:onNetworkLeaseReleased()
+        NetworkListener._getTxPackets.returns(100)
+
+        scheduled_callback()
+
+        assert.equals(100, NetworkListener._last_tx_packets)
+        assert.equals(5 * 60, NetworkListener._activity_check_delay_seconds)
+        assert.equals(5 * 60, scheduled_delay)
+        assert.is_nil(NetworkListener._released_lease_recheck)
     end)
 
     it("does nothing when automatic shutdown cannot apply", function()

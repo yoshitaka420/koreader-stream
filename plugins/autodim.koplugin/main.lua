@@ -22,7 +22,9 @@ local C_ = _.pgettext
 local Powerd = Device.powerd
 local T = FFIUtil.template
 
-local DEFAULT_AUTODIM_STARTTIME_M = 5
+-- Dim before the focused build's five-minute autosuspend timeout. A saved -1
+-- still disables the feature for users who explicitly opted out.
+local DEFAULT_AUTODIM_STARTTIME_M = Device:isKobo() and 2 or 5
 local DEFAULT_AUTODIM_DURATION_S = 5
 local DEFAULT_AUTODIM_FRACTION = 20
 local AUTODIM_EVENT_FREQUENCY = 2 -- in Hz; Frequenzy for FrontlightChangedEvent on E-Ink devices
@@ -32,7 +34,7 @@ local AutoDim = WidgetContainer:extend{
 }
 
 function AutoDim:init()
-    self.autodim_starttime_m = G_reader_settings:readSetting("autodim_starttime_minutes", -1)
+    self.autodim_starttime_m = G_reader_settings:readSetting("autodim_starttime_minutes", DEFAULT_AUTODIM_STARTTIME_M)
     self.autodim_duration_s = G_reader_settings:readSetting("autodim_duration_seconds", DEFAULT_AUTODIM_DURATION_S)
     self.autodim_fraction = G_reader_settings:readSetting("autodim_fraction", DEFAULT_AUTODIM_FRACTION)
 

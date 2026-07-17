@@ -4,27 +4,22 @@ Date: Wed, 15 Jul 2026 18:07:15 +0530
 Subject: [PATCH] Add secure WebDAV range streaming
 
 ---
- .gitignore                                    |   9 +
- README.md                                     |  16 +-
- ffi-cdecl/wrap-mupdf_cdecl.c                  |  13 +
- ffi/mupdf.lua                                 | 183 +++-
- ffi/mupdf_h.lua                               |  61 ++
- spec/support/webdav_range_server.py           | 216 +++++
- spec/unit/webdav_range_stream_spec.lua        | 324 +++++++
- .../cmake_modules/koreader_targets.cmake      |   5 +-
- .../koreader_thirdparty_libs.cmake            |   9 +
- thirdparty/curl/CMakeLists.txt                |   7 +-
- .../curl/disable_macos_copyproxies.patch      |  11 +
- webdav-range-stream.c                         | 867 ++++++++++++++++++
- webdav-range-stream.h                         |  83 ++
- wrap-mupdf.c                                  |  24 +
- wrap-mupdf.h                                  |  17 +-
- 15 files changed, 1834 insertions(+), 11 deletions(-)
- create mode 100644 spec/support/webdav_range_server.py
- create mode 100644 spec/unit/webdav_range_stream_spec.lua
- create mode 100644 thirdparty/curl/disable_macos_copyproxies.patch
- create mode 100644 webdav-range-stream.c
- create mode 100644 webdav-range-stream.h
+ .gitignore                                         |   9 +
+ README.md                                          |  16 +-
+ ffi-cdecl/wrap-mupdf_cdecl.c                       |  14 +
+ ffi/mupdf.lua                                      | 294 ++++++-
+ ffi/mupdf_h.lua                                    |  64 ++
+ spec/support/webdav_range_server.py                | 218 +++++
+ spec/unit/webdav_range_stream_spec.lua             | 420 +++++++++
+ thirdparty/cmake_modules/koreader_targets.cmake    |   5 +-
+ .../cmake_modules/koreader_thirdparty_libs.cmake   |   9 +
+ thirdparty/curl/CMakeLists.txt                     |   7 +-
+ thirdparty/curl/disable_macos_copyproxies.patch    |  11 +
+ webdav-range-stream.c                              | 957 +++++++++++++++++++++
+ webdav-range-stream.h                              |  88 ++
+ wrap-mupdf.c                                       |  24 +
+ wrap-mupdf.h                                       |  20 +-
+ 15 files changed, 2145 insertions(+), 11 deletions(-)
 
 diff --git a/.gitignore b/.gitignore
 index 70694896..dae8e0d8 100644
@@ -71,7 +66,7 @@ index a22e061f..f5071de2 100644
 
  It uses the MuPDF library (see http://mupdf.com/), djvulibre library,
 diff --git a/ffi-cdecl/wrap-mupdf_cdecl.c b/ffi-cdecl/wrap-mupdf_cdecl.c
-index 8e346052..6d7e7d6c 100644
+index 8e346052..b1108be9 100644
 --- a/ffi-cdecl/wrap-mupdf_cdecl.c
 +++ b/ffi-cdecl/wrap-mupdf_cdecl.c
 @@ -50,6 +50,10 @@ cdecl_func(fz_runetochar)
@@ -85,11 +80,12 @@ index 8e346052..6d7e7d6c 100644
  cdecl_type(fz_location)
  cdecl_type(fz_outline)
  cdecl_struct(fz_outline)
-@@ -61,6 +65,15 @@ cdecl_type(fz_device)
+@@ -61,6 +65,16 @@ cdecl_type(fz_device)
 
  cdecl_func(mupdf_open_document)
  cdecl_func(mupdf_open_document_with_stream_and_dir)
 +cdecl_func(mupdf_new_webdav_range_stream)
++cdecl_func(mupdf_new_probed_webdav_range_stream)
 +cdecl_func(mupdf_probe_webdav_range)
 +cdecl_func(mupdf_webdav_stream_finish_open)
 +cdecl_func(mupdf_webdav_stream_begin_operation)
@@ -102,7 +98,7 @@ index 8e346052..6d7e7d6c 100644
  cdecl_func(fz_needs_password)
  cdecl_func(fz_authenticate_password)
 diff --git a/ffi/mupdf.lua b/ffi/mupdf.lua
-index 03988eaa..2f302bf7 100644
+index 03988eaa..97dc0822 100644
 --- a/ffi/mupdf.lua
 +++ b/ffi/mupdf.lua
 @@ -87,19 +87,41 @@ local function context()
@@ -116,13 +112,13 @@ index 03988eaa..2f302bf7 100644
          ffi.string(W.mupdf_error_message(ctx)),
 -        W.mupdf_error_code(ctx)))
 +        W.mupdf_error_code(ctx))
-+end
-+
-+local function merror(ctx, message)
-+    error(merror_message(ctx, message))
  end
 
 -local function drop_document(ctx, doc)
++local function merror(ctx, message)
++    error(merror_message(ctx, message))
++end
++
 +local function drop_document(ctx, doc, remote_stream)
      -- Clear the cdata finalizer to avoid a double-free
      ffi.gc(doc, nil)
@@ -151,7 +147,7 @@ index 03988eaa..2f302bf7 100644
  local function drop_page(ctx, page)
      -- Clear the cdata finalizer to avoid a double-free
      ffi.gc(page, nil)
-@@ -134,6 +156,107 @@ function mupdf.openDocument(filename)
+@@ -134,6 +156,216 @@ function mupdf.openDocument(filename)
      return mupdf_doc
  end
 
@@ -175,6 +171,98 @@ index 03988eaa..2f302bf7 100644
 +    return remote
 +end
 +
++local function snapshotRemoteOptions(remote)
++    -- Validators are intentionally excluded: a retained GET probe may replace
++    -- catalog validators with the authoritative values it observed. Every
++    -- option that controls the endpoint, credentials, cache, or limits must
++    -- remain identical before the native stream can be transferred.
++    return {
++        url = ffi.string(remote.url),
++        username = ffi.string(remote.username),
++        password = ffi.string(remote.password),
++        content_length = tonumber(remote.content_length),
++        block_size = tonumber(remote.block_size),
++        cache_limit = tonumber(remote.cache_limit),
++        opening_transfer_limit = tonumber(remote.opening_transfer_limit),
++        operation_transfer_limit = tonumber(remote.operation_transfer_limit),
++        connect_timeout_ms = tonumber(remote.connect_timeout_ms),
++        transfer_timeout_ms = tonumber(remote.transfer_timeout_ms),
++        strict_mode = tonumber(remote.strict_mode),
++    }
++end
++
++local function sameRemoteOptions(left, right)
++    if not left or not right then return false end
++    for key, value in pairs(left) do
++        if right[key] ~= value then return false end
++    end
++    for key in pairs(right) do
++        if left[key] == nil then return false end
++    end
++    return true
++end
++
++local function remoteProbeResult(result, session)
++    return {
++        content_length = tonumber(result.content_length),
++        etag = result.etag[0] ~= 0 and ffi.string(result.etag) or nil,
++        last_modified = result.last_modified[0] ~= 0 and ffi.string(result.last_modified) or nil,
++        strong_etag = result.strong_etag ~= 0,
++        http_status = tonumber(result.http_status),
++        _session = session,
++    }
++end
++
++local remote_probe_session_mt = { __index = {} }
++
++function remote_probe_session_mt.__index:close()
++    if self.stream == nil then return end
++    local stream = ffi.gc(self.stream, nil)
++    local ctx = self.ctx
++    self.stream = nil
++    self.ctx = nil
++    self.options = nil
++    self.snapshot = nil
++    W.mupdf_webdav_stream_clear_cache(ctx, stream)
++    W.mupdf_drop_stream(ctx, stream)
++    drop_context(ctx)
++end
++
++local function newRemoteProbeSession(ctx, stream, options, remote)
++    local held_ctx = keep_context(ctx)
++    stream = ffi.gc(stream, function(native_stream)
++        W.mupdf_webdav_stream_clear_cache(ctx, native_stream)
++        W.mupdf_drop_stream(ctx, native_stream)
++        drop_context(ctx)
++    end)
++    return setmetatable({
++        ctx = held_ctx,
++        stream = stream,
++        options = options,
++        snapshot = snapshotRemoteOptions(remote),
++    }, remote_probe_session_mt)
++end
++
++local function takeRemoteProbeSession(options, remote)
++    local session = options._probe_session
++    if type(session) ~= "table" or session.stream == nil or session.ctx == nil then
++        return
++    end
++    if session.options ~= options
++            or not sameRemoteOptions(session.snapshot, snapshotRemoteOptions(remote)) then
++        session:close()
++        options._probe_session = nil
++        return
++    end
++    local stream = ffi.gc(session.stream, nil)
++    local ctx = session.ctx
++    session.stream = nil
++    session.ctx = nil
++    session.options = nil
++    session.snapshot = nil
++    return ctx, stream
++end
++
 +--- Perform a bounded one-byte range probe without opening a document.
 +function mupdf.probeRemote(options)
 +    local ctx = context()
@@ -187,22 +275,35 @@ index 03988eaa..2f302bf7 100644
 +    if W.mupdf_probe_webdav_range(ctx, remote, result) == 0 then
 +        merror(ctx, "Remote range probe failed")
 +    end
-+    return {
-+        content_length = tonumber(result.content_length),
-+        etag = result.etag[0] ~= 0 and ffi.string(result.etag) or nil,
-+        last_modified = result.last_modified[0] ~= 0 and ffi.string(result.last_modified) or nil,
-+        strong_etag = result.strong_etag ~= 0,
-+        http_status = tonumber(result.http_status),
-+    }
++    return remoteProbeResult(result)
++end
++
++--- Probe a remote document while retaining the configured native stream and
++--- libcurl connection for the immediately following document open.
++function mupdf.probeRemoteStream(options)
++    local ctx = context()
++    local remote = makeRemoteOptions(options)
++    local result = ffi.new("mupdf_webdav_probe_result")
++    local stream = W.mupdf_new_probed_webdav_range_stream(ctx, remote, result)
++    if stream == nil then
++        merror(ctx, "Remote range probe failed")
++    end
++    return remoteProbeResult(result, newRemoteProbeSession(ctx, stream, options, remote))
 +end
 +
 +--- Open a seekable remote CBZ/CBR through MuPDF.
 +function mupdf.openRemoteDocument(options)
-+    local ctx = context()
++    -- Validate and materialize every option before disarming a retained
++    -- session's finalizer. If this raises, the session still owns its stream.
 +    local remote = makeRemoteOptions(options)
-+    local stream = W.mupdf_new_webdav_range_stream(ctx, remote)
-+    if stream == nil then
-+        merror(ctx, "Cannot create remote range stream")
++    local ctx, stream = takeRemoteProbeSession(options, remote)
++    local reused_probe = stream ~= nil
++    ctx = ctx or context()
++    if not stream then
++        stream = W.mupdf_new_webdav_range_stream(ctx, remote)
++        if stream == nil then
++            merror(ctx, "Cannot create remote range stream")
++        end
 +    end
 +
 +    local magic = options.magic or options.display_name or ("remote." .. (options.extension or "cbz"))
@@ -219,6 +320,7 @@ index 03988eaa..2f302bf7 100644
 +            message = merror_message(ctx, "MuPDF cannot open remote document")
 +        end
 +        drop_failed_remote_open(ctx, nil, stream)
++        if reused_probe then drop_context(ctx) end
 +        error(message)
 +    end
 +
@@ -237,6 +339,7 @@ index 03988eaa..2f302bf7 100644
 +            message = "MuPDF found no pages in remote file"
 +        end
 +        drop_failed_remote_open(ctx, doc, stream)
++        if reused_probe then drop_context(ctx) end
 +        error(message)
 +    end
 +
@@ -250,7 +353,9 @@ index 03988eaa..2f302bf7 100644
 +    mupdf_doc.doc = ffi.gc(mupdf_doc.doc, function(document)
 +        drop_document(ctx, document, stream)
 +    end)
-+    mupdf_doc.ctx = keep_context(ctx)
++    -- A retained probe already owns one context reference; transfer it to the
++    -- document instead of incrementing the reference count a second time.
++    mupdf_doc.ctx = reused_probe and ctx or keep_context(ctx)
 +    setmetatable(mupdf_doc, document_mt)
 +
 +    return mupdf_doc
@@ -259,7 +364,7 @@ index 03988eaa..2f302bf7 100644
  function mupdf.openDocumentFromText(text, magic, html_resource_directory)
      local ctx = context()
      local stream = W.mupdf_open_memory(ctx, ffi.cast("const unsigned char*", text), #text)
-@@ -175,12 +298,46 @@ triggered explicitly
+@@ -175,12 +407,48 @@ triggered explicitly
  --]]
  function document_mt.__index:close()
      if self.doc ~= nil then
@@ -268,9 +373,9 @@ index 03988eaa..2f302bf7 100644
          self.doc = nil
          self.ctx = nil
 +        self.remote_stream = nil
-     end
- end
-
++    end
++end
++
 +function document_mt.__index:getNetworkStats()
 +    if self.remote_stream == nil then return end
 +    local stats = ffi.new("mupdf_webdav_stream_stats")
@@ -282,6 +387,8 @@ index 03988eaa..2f302bf7 100644
 +        bytes_received = tonumber(stats.bytes_received),
 +        cache_hits = tonumber(stats.cache_hits),
 +        cache_misses = tonumber(stats.cache_misses),
++        block_allocations = tonumber(stats.block_allocations),
++        block_reuses = tonumber(stats.block_reuses),
 +        cached_bytes = tonumber(stats.cached_bytes),
 +        peak_cached_bytes = tonumber(stats.peak_cached_bytes),
 +        opening_bytes = tonumber(stats.opening_bytes),
@@ -295,9 +402,9 @@ index 03988eaa..2f302bf7 100644
 +function document_mt.__index:clearRemoteCache()
 +    if self.remote_stream ~= nil then
 +        W.mupdf_webdav_stream_clear_cache(self.ctx, self.remote_stream)
-+    end
-+end
-+
+     end
+ end
+
 +function document_mt.__index:getRemoteError()
 +    if self.remote_stream == nil then return end
 +    local message = W.mupdf_webdav_stream_last_error(self.remote_stream)
@@ -307,7 +414,7 @@ index 03988eaa..2f302bf7 100644
  --[[
  check if the document needs a password for access
  --]]
-@@ -272,11 +429,27 @@ open a page, return page object
+@@ -272,11 +540,27 @@ open a page, return page object
  --]]
  function document_mt.__index:openPage(number)
      local ctx = self.ctx
@@ -336,10 +443,10 @@ index 03988eaa..2f302bf7 100644
      if mupdf_page.page == nil then
          merror(ctx, "cannot open page #" .. number)
 diff --git a/ffi/mupdf_h.lua b/ffi/mupdf_h.lua
-index 2ddc1ab5..529fd50f 100644
+index 2ddc1ab5..e554817b 100644
 --- a/ffi/mupdf_h.lua
 +++ b/ffi/mupdf_h.lua
-@@ -60,6 +60,58 @@ fz_pixmap *mupdf_get_pixmap_from_image(fz_context *, fz_image *, const fz_irect
+@@ -60,6 +60,60 @@ fz_pixmap *mupdf_get_pixmap_from_image(fz_context *, fz_image *, const fz_irect
  void fz_drop_image(fz_context *, fz_image *);
  int fz_runetochar(char *, int);
  typedef struct fz_stream fz_stream;
@@ -387,6 +494,8 @@ index 2ddc1ab5..529fd50f 100644
 +  uint64_t bytes_received;
 +  uint64_t cache_hits;
 +  uint64_t cache_misses;
++  uint64_t block_allocations;
++  uint64_t block_reuses;
 +  uint64_t cached_bytes;
 +  uint64_t peak_cached_bytes;
 +  uint64_t opening_bytes;
@@ -398,11 +507,12 @@ index 2ddc1ab5..529fd50f 100644
  typedef struct {
    int chapter;
    int page;
-@@ -92,6 +144,15 @@ typedef struct fz_document fz_document;
+@@ -92,6 +146,16 @@ typedef struct fz_document fz_document;
  typedef struct fz_device fz_device;
  fz_document *mupdf_open_document(fz_context *, const char *);
  fz_document *mupdf_open_document_with_stream_and_dir(fz_context *, const char *, fz_stream *, fz_archive *);
 +fz_stream *mupdf_new_webdav_range_stream(fz_context *, const mupdf_webdav_stream_options *);
++fz_stream *mupdf_new_probed_webdav_range_stream(fz_context *, const mupdf_webdav_stream_options *, mupdf_webdav_probe_result *);
 +int mupdf_probe_webdav_range(fz_context *, const mupdf_webdav_stream_options *, mupdf_webdav_probe_result *);
 +void mupdf_webdav_stream_finish_open(fz_stream *);
 +void mupdf_webdav_stream_begin_operation(fz_stream *);
@@ -416,10 +526,10 @@ index 2ddc1ab5..529fd50f 100644
  int fz_authenticate_password(fz_context *, fz_document *, const char *);
 diff --git a/spec/support/webdav_range_server.py b/spec/support/webdav_range_server.py
 new file mode 100644
-index 00000000..e740528d
+index 00000000..efacd075
 --- /dev/null
 +++ b/spec/support/webdav_range_server.py
-@@ -0,0 +1,216 @@
+@@ -0,0 +1,218 @@
 +#!/usr/bin/env python3
 +"""Small adversarial HTTP/WebDAV range server used by KOReader tests.
 +
@@ -492,6 +602,7 @@ index 00000000..e740528d
 +        return {
 +            "authorization_present": self.headers.get("Authorization") is not None,
 +            "bytes_sent": sent,
++            "client_port": self.client_address[1],
 +            "if_range": self.headers.get("If-Range"),
 +            "method": self.command,
 +            "mode": mode,
@@ -588,7 +699,8 @@ index 00000000..e740528d
 +        if status == 206:
 +            range_start = start + 1 if mode == "bad-range" else start
 +            self.send_header("Content-Range", f"bytes {range_start}-{end}/{total}")
-+        self.send_header("Connection", "close")
++        if mode != "keepalive":
++            self.send_header("Connection", "close")
 +        self.end_headers()
 +
 +        sent = 0
@@ -638,10 +750,10 @@ index 00000000..e740528d
 +    main()
 diff --git a/spec/unit/webdav_range_stream_spec.lua b/spec/unit/webdav_range_stream_spec.lua
 new file mode 100644
-index 00000000..2b876a15
+index 00000000..0841c19e
 --- /dev/null
 +++ b/spec/unit/webdav_range_stream_spec.lua
-@@ -0,0 +1,324 @@
+@@ -0,0 +1,420 @@
 +local Archiver = require("ffi/archiver")
 +local DrawContext = require("ffi/drawcontext")
 +local M = require("ffi/mupdf")
@@ -792,6 +904,100 @@ index 00000000..2b876a15
 +        assert.equals(206, result.http_status)
 +    end)
 +
++    it("retains and consumes a probed stream for the document open", function()
++        local options = {}
++        for key, value in pairs(standard_options) do options[key] = value end
++        local result = M.probeRemoteStream(options)
++        assert.is_table(result._session)
++        options._probe_session = result._session
++
++        local doc = M.openRemoteDocument(options)
++        assert.equals(3, doc:getPages())
++        assert.is_nil(result._session.stream)
++        local stats = doc:getNetworkStats()
++        -- The one-byte probe is part of the retained native state's totals.
++        assert.is_true(stats.request_count > 1)
++        assert.is_true(stats.bytes_received > 1)
++        doc:close()
++        -- Closing an already-consumed session is deliberately harmless.
++        result._session:close()
++    end)
++
++    it("reuses the probe TCP connection for the retained archive stream", function()
++        local options = {}
++        for key, value in pairs(standard_options) do options[key] = value end
++        options.url = base_url .. "/book.cbz?mode=keepalive"
++        local result = M.probeRemoteStream(options)
++        options._probe_session = result._session
++        local doc = M.openRemoteDocument(options)
++        assert.equals(3, doc:getPages())
++        doc:close()
++
++        ffiUtil.usleep(50000)
++        local log = readFile(server.log_file)
++        local ports = {}
++        for line in log:gmatch("[^\n]+") do
++            if line:find('"mode": "keepalive"', 1, true) then
++                table.insert(ports, tonumber(assert(line:match('"client_port": (%d+)'))))
++            end
++        end
++        assert.is_true(#ports > 1)
++        for index = 2, #ports do
++            assert.equals(ports[1], ports[index])
++        end
++    end)
++
++    it("never consumes a retained stream with a different or invalid option table", function()
++        local probed_options = {}
++        for key, value in pairs(standard_options) do probed_options[key] = value end
++        local result = M.probeRemoteStream(probed_options)
++
++        -- Option validation happens before ownership transfer, so a malformed
++        -- source leaves the retained stream safely owned by its session.
++        local saved_url = probed_options.url
++        probed_options.url = nil
++        local ok = pcall(M.openRemoteDocument, probed_options)
++        assert.is_false(ok)
++        assert.is_not_nil(result._session.stream)
++        probed_options.url = saved_url
++
++        -- A copied table may look identical but is not the source that owns
++        -- this session. It must close the retained stream and open a fresh one.
++        local copied_options = {}
++        for key, value in pairs(probed_options) do copied_options[key] = value end
++        copied_options._probe_session = result._session
++        local doc = M.openRemoteDocument(copied_options)
++        assert.equals(3, doc:getPages())
++        assert.is_nil(result._session.stream)
++        doc:close()
++    end)
++
++    it("rejects an in-place mutation of retained stream options", function()
++        local options = {}
++        for key, value in pairs(standard_options) do options[key] = value end
++        local result = M.probeRemoteStream(options)
++        options._probe_session = result._session
++
++        -- Table identity alone is insufficient: mutating the endpoint after
++        -- probing must close the old stream and attempt the new URL afresh.
++        options.url = base_url .. "/book.cbz?mode=missing"
++        local ok, err = pcall(M.openRemoteDocument, options)
++        assertErrorContains(ok, err, "remote file is unavailable")
++        assert.is_nil(result._session.stream)
++    end)
++
++    it("counts a retained probe against strict opening limits", function()
++        local options = {}
++        for key, value in pairs(standard_options) do options[key] = value end
++        options.strict_mode = true
++        options.opening_transfer_limit = 1
++        local result = M.probeRemoteStream(options)
++        options._probe_session = result._session
++        local ok, err = pcall(M.openRemoteDocument, options)
++        assertErrorContains(ok, err, "opening transfer limit exceeded")
++        assert.is_nil(result._session.stream)
++    end)
++
 +    it("renders arbitrary CBZ pages without transferring the archive", function()
 +        local doc = M.openRemoteDocument(standard_options)
 +        assert.equals(3, doc:getPages())
@@ -807,6 +1013,8 @@ index 00000000..2b876a15
 +        assert.is_true(stats.request_count > 1)
 +        assert.is_true(stats.peak_cached_bytes <= standard_options.cache_limit)
 +        assert.is_true(stats.cached_bytes <= standard_options.cache_limit)
++        assert.is_true(stats.block_allocations > 0)
++        assert.is_true(stats.block_reuses > 0)
 +        doc:clearRemoteCache()
 +        assert.equals(0, doc:getNetworkStats().cached_bytes)
 +        doc:close()
@@ -1054,10 +1262,10 @@ index 00000000..2f42cf69
 + #endif
 diff --git a/webdav-range-stream.c b/webdav-range-stream.c
 new file mode 100644
-index 00000000..c65524cc
+index 00000000..9081feee
 --- /dev/null
 +++ b/webdav-range-stream.c
-@@ -0,0 +1,866 @@
+@@ -0,0 +1,957 @@
 +#include "webdav-range-stream.h"
 +
 +#include <curl/curl.h>
@@ -1076,6 +1284,7 @@ index 00000000..c65524cc
 +typedef struct range_block {
 +    int64_t index;
 +    size_t length;
++    size_t capacity;
 +    unsigned char *data;
 +    struct range_block *newer;
 +    struct range_block *older;
@@ -1114,6 +1323,8 @@ index 00000000..c65524cc
 +    uint64_t bytes_received;
 +    uint64_t cache_hits;
 +    uint64_t cache_misses;
++    uint64_t block_allocations;
++    uint64_t block_reuses;
 +    uint64_t opening_bytes;
 +    uint64_t operation_limit_hits;
 +    uint64_t sequential_run;
@@ -1166,6 +1377,16 @@ index 00000000..c65524cc
 +        length = capacity - 1;
 +    memcpy(destination, source, length);
 +    destination[length] = '\0';
++}
++
++static void replace_state_string(fz_context *ctx, char **destination, const char *source)
++{
++    char *replacement = fz_strdup(ctx, source ? source : "");
++    if (*destination) {
++        secure_zero(*destination, strlen(*destination));
++        fz_free(ctx, *destination);
++    }
++    *destination = replacement;
 +}
 +
 +static void set_error(webdav_range_state *state, int code, const char *format, ...)
@@ -1354,16 +1575,24 @@ index 00000000..c65524cc
 +#undef SETOPT
 +}
 +
++static void drop_block(fz_context *ctx, range_block *block)
++{
++    if (!block)
++        return;
++    if (block->data) {
++        secure_zero(block->data, block->capacity);
++        fz_free(ctx, block->data);
++    }
++    secure_zero(block, sizeof(*block));
++    fz_free(ctx, block);
++}
++
 +static void clear_blocks(fz_context *ctx, webdav_range_state *state)
 +{
 +    range_block *block = state->newest;
 +    while (block) {
 +        range_block *next = block->older;
-+        if (block->data) {
-+            secure_zero(block->data, block->length);
-+            fz_free(ctx, block->data);
-+        }
-+        fz_free(ctx, block);
++        drop_block(ctx, block);
 +        block = next;
 +    }
 +    state->newest = NULL;
@@ -1657,16 +1886,14 @@ index 00000000..c65524cc
 +    state->newest = block;
 +}
 +
-+static void evict_oldest(fz_context *ctx, webdav_range_state *state)
++static range_block *detach_oldest(webdav_range_state *state)
 +{
 +    range_block *block = state->oldest;
 +    if (!block)
-+        return;
++        return NULL;
 +    unlink_block(state, block);
 +    state->cached_bytes -= block->length;
-+    secure_zero(block->data, block->length);
-+    fz_free(ctx, block->data);
-+    fz_free(ctx, block);
++    return block;
 +}
 +
 +static range_block *fetch_block(fz_context *ctx, webdav_range_state *state, int64_t index)
@@ -1676,6 +1903,7 @@ index 00000000..c65524cc
 +    int64_t end;
 +    size_t wanted;
 +    size_t received = 0;
++    range_block *candidate;
 +
 +    if (index < 0 || index > INT64_MAX / (int64_t)state->block_size) {
 +        set_error(state, MUPDF_WEBDAV_ERROR_ARGUMENT, "remote stream: invalid block index");
@@ -1691,12 +1919,32 @@ index 00000000..c65524cc
 +
 +    fz_var(block);
 +    fz_try(ctx) {
-+        block = fz_calloc(ctx, 1, sizeof(*block));
-+        /* Evict before allocating the incoming block so the block buffers
-+         * never transiently exceed the configured RAM ceiling. */
-+        while (state->cached_bytes + wanted > state->cache_limit)
-+            evict_oldest(ctx, state);
-+        block->data = fz_malloc(ctx, wanted);
++        /* Recycle a detached LRU buffer when possible. Besides avoiding an
++         * allocator round trip, this avoids securely zeroing and then fully
++         * rewriting a MiB-sized block on every cache miss once the cache is
++         * warm. All buffers are still wiped on final close and error paths. */
++        while (state->cached_bytes + wanted > state->cache_limit) {
++            candidate = detach_oldest(state);
++            if (!candidate)
++                break;
++            if (!block && candidate->capacity >= wanted) {
++                block = candidate;
++            } else {
++                drop_block(ctx, candidate);
++            }
++        }
++        if (block) {
++            state->block_reuses++;
++            block->index = 0;
++            block->length = 0;
++            block->newer = NULL;
++            block->older = NULL;
++        } else {
++            block = fz_calloc(ctx, 1, sizeof(*block));
++            block->data = fz_malloc(ctx, wanted);
++            block->capacity = wanted;
++            state->block_allocations++;
++        }
 +        if (!perform_range_request(state, start, end, block->data, wanted, &received))
 +            break;
 +        block->index = index;
@@ -1707,21 +1955,11 @@ index 00000000..c65524cc
 +            state->peak_cached_bytes = state->cached_bytes;
 +    }
 +    fz_catch(ctx) {
-+        if (block) {
-+            if (block->data)
-+                fz_free(ctx, block->data);
-+            fz_free(ctx, block);
-+        }
++        drop_block(ctx, block);
 +        fz_rethrow(ctx);
 +    }
 +    if (state->error_code != MUPDF_WEBDAV_ERROR_NONE) {
-+        if (block) {
-+            if (block->data) {
-+                secure_zero(block->data, wanted);
-+                fz_free(ctx, block->data);
-+            }
-+            fz_free(ctx, block);
-+        }
++        drop_block(ctx, block);
 +        clear_blocks(ctx, state);
 +        return NULL;
 +    }
@@ -1825,6 +2063,69 @@ index 00000000..c65524cc
 +    return stream;
 +}
 +
++static void fill_probe_result(webdav_range_state *state, mupdf_webdav_probe_result *result)
++{
++    result->content_length = state->content_length;
++    result->strong_etag = is_strong_etag(state->response_etag);
++    result->http_status = state->last_http_status;
++    copy_string(result->etag, sizeof(result->etag), state->response_etag);
++    copy_string(result->last_modified, sizeof(result->last_modified), state->response_last_modified);
++}
++
++static void adopt_probe_validator(fz_context *ctx, webdav_range_state *state)
++{
++    /* A retained probe state must protect every later range with the validator
++     * actually observed through GET. Prefer a strong ETag; otherwise fall back
++     * to Last-Modified. Existing usable validators have already been checked
++     * by perform_range_request and remain authoritative. */
++    if (state->strong_etag || state->last_modified[0])
++        return;
++    if (is_strong_etag(state->response_etag)) {
++        replace_state_string(ctx, &state->etag, state->response_etag);
++        state->strong_etag = 1;
++    } else if (state->response_last_modified[0]) {
++        replace_state_string(ctx, &state->last_modified, state->response_last_modified);
++    }
++}
++
++fz_stream *webdav_range_stream_open_probed(fz_context *ctx,
++                                            const mupdf_webdav_stream_options *options,
++                                            mupdf_webdav_probe_result *result)
++{
++    webdav_range_state *state = NULL;
++    fz_stream *stream = NULL;
++    unsigned char byte = 0;
++    size_t received = 0;
++
++    if (!result)
++        fz_throw(ctx, FZ_ERROR_ARGUMENT, "remote stream: probe result is required");
++    memset(result, 0, sizeof(*result));
++
++    fz_var(state);
++    fz_var(stream);
++    fz_try(ctx) {
++        state = new_state(ctx, options, 1);
++        if (!perform_range_request(state, 0, 0, &byte, 1, &received)) {
++            result->error_code = state->error_code;
++            result->http_status = state->last_http_status;
++            copy_string(result->error_message, sizeof(result->error_message), state->error_message);
++            fz_throw(ctx, FZ_ERROR_SYSTEM, "%s", result->error_message);
++        }
++        fill_probe_result(state, result);
++        adopt_probe_validator(ctx, state);
++        stream = fz_new_stream(ctx, state, next_range, drop_state);
++        state = NULL;
++        stream->seek = seek_range;
++        stream->rp = ((webdav_range_state *)stream->state)->empty;
++        stream->wp = ((webdav_range_state *)stream->state)->empty;
++    }
++    fz_catch(ctx) {
++        drop_state(ctx, state);
++        fz_rethrow(ctx);
++    }
++    return stream;
++}
++
 +int webdav_range_stream_probe(fz_context *ctx, const mupdf_webdav_stream_options *options,
 +                              mupdf_webdav_probe_result *result)
 +{
@@ -1840,11 +2141,7 @@ index 00000000..c65524cc
 +    memset(result, 0, sizeof(*result));
 +    state = new_state(ctx, options, 1);
 +    if (perform_range_request(state, 0, 0, &byte, 1, &received)) {
-+        result->content_length = state->content_length;
-+        result->strong_etag = is_strong_etag(state->response_etag);
-+        result->http_status = state->last_http_status;
-+        copy_string(result->etag, sizeof(result->etag), state->response_etag);
-+        copy_string(result->last_modified, sizeof(result->last_modified), state->response_last_modified);
++        fill_probe_result(state, result);
 +        ok = 1;
 +    } else {
 +        error_code = state->error_code;
@@ -1909,6 +2206,8 @@ index 00000000..c65524cc
 +    stats->bytes_received = state->bytes_received;
 +    stats->cache_hits = state->cache_hits;
 +    stats->cache_misses = state->cache_misses;
++    stats->block_allocations = state->block_allocations;
++    stats->block_reuses = state->block_reuses;
 +    stats->cached_bytes = state->cached_bytes;
 +    stats->peak_cached_bytes = state->peak_cached_bytes;
 +    stats->opening_bytes = state->opening_bytes;
@@ -1926,10 +2225,10 @@ index 00000000..c65524cc
 +}
 diff --git a/webdav-range-stream.h b/webdav-range-stream.h
 new file mode 100644
-index 00000000..9b524b47
+index 00000000..1f2df3f4
 --- /dev/null
 +++ b/webdav-range-stream.h
-@@ -0,0 +1,83 @@
+@@ -0,0 +1,88 @@
 +#ifndef KOREADER_WEBDAV_RANGE_STREAM_H
 +#define KOREADER_WEBDAV_RANGE_STREAM_H
 +
@@ -1989,6 +2288,8 @@ index 00000000..9b524b47
 +    uint64_t bytes_received;
 +    uint64_t cache_hits;
 +    uint64_t cache_misses;
++    uint64_t block_allocations;
++    uint64_t block_reuses;
 +    uint64_t cached_bytes;
 +    uint64_t peak_cached_bytes;
 +    uint64_t opening_bytes;
@@ -2001,6 +2302,9 @@ index 00000000..9b524b47
 +/* These helpers may throw MuPDF exceptions and must only be called inside a
 + * MuPDF exception wrapper. */
 +fz_stream *webdav_range_stream_open(fz_context *ctx, const mupdf_webdav_stream_options *options);
++fz_stream *webdav_range_stream_open_probed(fz_context *ctx,
++                                            const mupdf_webdav_stream_options *options,
++                                            mupdf_webdav_probe_result *result);
 +int webdav_range_stream_probe(fz_context *ctx, const mupdf_webdav_stream_options *options,
 +                              mupdf_webdav_probe_result *result);
 +
@@ -2049,7 +2353,7 @@ index 8d7ad7cb..9660d1ff 100644
      *m = fz_scale(sx, sy);
      return m;
 diff --git a/wrap-mupdf.h b/wrap-mupdf.h
-index a83b9cf8..ffa8fbbf 100644
+index a83b9cf8..c5578830 100644
 --- a/wrap-mupdf.h
 +++ b/wrap-mupdf.h
 @@ -22,6 +22,7 @@
@@ -2074,20 +2378,23 @@ index a83b9cf8..ffa8fbbf 100644
  DLL_PUBLIC fz_matrix *mupdf_fz_scale(fz_matrix *m, float sx, float sy);
  DLL_PUBLIC fz_matrix *mupdf_fz_translate(fz_matrix *m, float tx, float ty);
  DLL_PUBLIC fz_matrix *mupdf_fz_pre_rotate(fz_matrix *m, float theta);
-@@ -78,6 +86,12 @@ MUPDF_WRAP(mupdf_open_document, fz_document*, NULL,
+@@ -78,6 +86,15 @@ MUPDF_WRAP(mupdf_open_document, fz_document*, NULL,
  MUPDF_WRAP(mupdf_open_document_with_stream_and_dir, fz_document*, NULL,
      ret = fz_open_document_with_stream_and_dir(ctx, magic, stream, archive),
      const char *magic, fz_stream *stream, fz_archive *archive)
 +MUPDF_WRAP(mupdf_new_webdav_range_stream, fz_stream*, NULL,
 +    ret = webdav_range_stream_open(ctx, options),
 +    const mupdf_webdav_stream_options *options)
++MUPDF_WRAP(mupdf_new_probed_webdav_range_stream, fz_stream*, NULL,
++    ret = webdav_range_stream_open_probed(ctx, options, result),
++    const mupdf_webdav_stream_options *options, mupdf_webdav_probe_result *result)
 +MUPDF_WRAP(mupdf_probe_webdav_range, int, 0,
 +    ret = webdav_range_stream_probe(ctx, options, result),
 +    const mupdf_webdav_stream_options *options, mupdf_webdav_probe_result *result)
  MUPDF_WRAP(mupdf_open_memory, fz_stream*, NULL,
      ret = fz_open_memory(ctx, data, len),
      const unsigned char *data, size_t len)
-@@ -90,6 +104,8 @@ MUPDF_WRAP(mupdf_drop_archive, void*, NULL,
+@@ -90,6 +107,8 @@ MUPDF_WRAP(mupdf_drop_archive, void*, NULL,
  MUPDF_WRAP(mupdf_drop_stream, void*, NULL,
      { fz_drop_stream(ctx, stm); ret = (void*) -1; },
      fz_stream *stm)
@@ -2096,7 +2403,7 @@ index a83b9cf8..ffa8fbbf 100644
  MUPDF_WRAP(mupdf_count_pages, int, -1,
      ret = fz_count_pages(ctx, doc),
      fz_document *doc)
-@@ -201,4 +217,3 @@ MUPDF_WRAP(mupdf_new_buffer_from_shared_data, fz_buffer*, NULL,
+@@ -201,4 +220,3 @@ MUPDF_WRAP(mupdf_new_buffer_from_shared_data, fz_buffer*, NULL,
  MUPDF_WRAP(mupdf_drop_buffer, void*, NULL,
      { fz_drop_buffer(ctx, buf); ret = (void*) -1; },
      fz_buffer *buf)

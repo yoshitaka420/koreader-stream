@@ -141,10 +141,10 @@ collection.
   takes effect after a restart. An open remote book intentionally keeps Wi-Fi
   leased for reliable cache misses; close the reader or suspend the device
   when taking a long break.
-- **Settings → Device → Autosuspend timeout** defaults to 15 minutes and is the
+- **Settings → Device → Autosuspend timeout** defaults to 5 minutes and is the
   backstop for missed sleep-cover events. Full suspend turns Kobo Wi-Fi off.
-- **Settings → Screen → Automatic dimmer** is available but remains off until
-  enabled. It is useful when the frontlight is normally left on.
+- **Settings → Screen → Automatic dimmer** defaults to a 2-minute idle delay.
+  It is especially useful when the frontlight is normally left on.
 - Leave autostandby disabled unless it has been validated on the exact Kobo
   model. KOReader warns that standby is unreliable on some older boards, and
   it cannot engage while Wi-Fi is on.

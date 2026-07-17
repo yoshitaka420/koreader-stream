@@ -663,7 +663,14 @@ end
 function ReaderUI:showReader(file, provider, seamless, is_provider_forced, after_open_callback, source)
     logger.dbg("show reader ui")
 
+    local function closeSourceProbe()
+        local session = source and source._probe_session
+        if session and session.close then session:close() end
+        if source then source._probe_session = nil end
+    end
+
     if lfs.attributes(file, "mode") ~= "file" then
+        closeSourceProbe()
         UIManager:show(InfoMessage:new{
              text = T(_("File '%1' does not exist."), BD.filepath(filemanagerutil.abbreviate(file)))
         })
@@ -694,6 +701,10 @@ function ReaderUI:showReader(file, provider, seamless, is_provider_forced, after
                 or util.partialMD5(file)
             local arc_settings_file = DocSettings.getSettingsArcFile(self.md5_checksum, true) -- check if exists
             if arc_settings_file then
+                -- Waiting on a confirmation dialog must not keep an idle HTTP
+                -- connection (and its credentials) alive. The eventual open
+                -- can create a fresh stream after the user answers.
+                closeSourceProbe()
                 UIManager:show(ConfirmBox:new{
                     text =
 _[[This book was previously opened on this device.
@@ -714,6 +725,7 @@ Discarded metadata will be removed from the archive.]],
             end
         end
     else
+        closeSourceProbe()
         UIManager:show(InfoMessage:new{
             text = T(_("File '%1' is not supported."), BD.filepath(filemanagerutil.abbreviate(file)))
         })
@@ -771,6 +783,12 @@ function ReaderUI:showReaderCoroutine(file, provider, seamless, source)
         end)
         local ok, err = coroutine.resume(co)
         if err ~= nil or ok == false then
+            -- Also cover failures that happen before doShowReader reaches its
+            -- normal post-registry cleanup (for example, while tearing down a
+            -- stale ReaderUI instance).
+            local session = source and source._probe_session
+            if session and session.close then session:close() end
+            if source then source._probe_session = nil end
             io.stderr:write('[!] doShowReader coroutine crashed:\n')
             io.stderr:write(debug.traceback(co, err, 1))
             -- Restore input if we crashed before ReaderUI has restored it
@@ -794,7 +812,15 @@ function ReaderUI:doShowReader(file, provider, seamless, source)
         logger.warn("ReaderUI instance mismatch! Tried to spin up a new instance, while we still have an existing one:", tostring(ReaderUI.instance))
         ReaderUI.instance:onClose()
     end
-    local document = DocumentRegistry:openDocument(file, provider, source)
+    local open_ok, document = pcall(DocumentRegistry.openDocument, DocumentRegistry, file, provider, source)
+    -- A successful remote open consumes the retained probe stream. If the
+    -- registry rejected the document before that happened, close it now so a
+    -- native connection and credentials never wait for Lua's next GC cycle.
+    if source and source._probe_session then
+        if source._probe_session.close then source._probe_session:close() end
+        source._probe_session = nil
+    end
+    if not open_ok then error(document) end
     if not document then
         local text = _("No reader engine for this file or invalid file.")
         if require("document/remotedocument").isDescriptor(file) then

@@ -80,6 +80,79 @@ describe("network_manager module", function()
     end)
 end)
 
+describe("NetworkMgr connectivity polling backoff", function()
+    local Device
+    local NetworkMgr
+    local UIManager
+
+    setup(function()
+        require("commonrequire")
+        Device = require("device")
+        function Device:initNetworkManager(mgr)
+            function mgr:turnOnWifi() end
+            function mgr:turnOffWifi() end
+            function mgr:obtainIP() end
+            function mgr:releaseIP() end
+        end
+        function Device:hasWifiRestore() return false end
+    end)
+
+    before_each(function()
+        package.loaded["ui/network/manager"] = nil
+        G_reader_settings:saveSetting("wifi_was_on", false)
+        NetworkMgr = require("ui/network/manager")
+        UIManager = require("ui/uimanager")
+        stub(UIManager, "scheduleIn")
+        stub(NetworkMgr, "queryNetworkState")
+        NetworkMgr.queryNetworkState.invokes(function(self)
+            self.is_wifi_on = false
+            self.is_connected = false
+        end)
+        stub(NetworkMgr, "_abortWifiConnection")
+    end)
+
+    after_each(function()
+        NetworkMgr._abortWifiConnection:revert()
+        NetworkMgr.queryNetworkState:revert()
+        UIManager.scheduleIn:revert()
+        package.loaded["ui/network/manager"] = nil
+    end)
+
+    teardown(function()
+        function Device:initNetworkManager() end
+        function Device:hasWifiRestore() return false end
+    end)
+
+    it("backs off failed checks while preserving the 45-second deadline", function()
+        local delays = {}
+        local tasks = {}
+        UIManager.scheduleIn.invokes(function(_, delay, callback, ...)
+            local args = { n = select("#", ...), ... }
+            table.insert(delays, delay)
+            table.insert(tasks, { callback = callback, args = args })
+        end)
+
+        NetworkMgr:scheduleConnectivityCheck()
+        while #tasks > 0 do
+            local task = table.remove(tasks, 1)
+            task.callback(unpack(task.args, 1, task.args.n))
+        end
+
+        assert.equals(0.25, delays[1])
+        assert.equals(0.5, delays[2])
+        assert.equals(1, delays[3])
+        assert.equals(2, delays[4])
+        local elapsed = 0
+        for _, delay in ipairs(delays) do
+            assert.is_true(delay <= 2)
+            elapsed = elapsed + delay
+        end
+        assert.equals(45, elapsed)
+        assert.is_true(#delays < 30)
+        assert.stub(NetworkMgr._abortWifiConnection).was.called(1)
+    end)
+end)
+
 describe("NetworkMgr:hasLeaseForCurrentNetwork", function()
     local NetworkMgr
     local UIManager

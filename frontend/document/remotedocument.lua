@@ -213,6 +213,22 @@ function RemoteDocument.create(descriptor)
     }
     local encoded, err = rapidjson.encode(data, { pretty = true })
     if not encoded then error(err) end
+
+    -- Reopening a remote book usually recreates the same descriptor. Avoid a
+    -- flash write and fsync when neither its serialized bytes nor its decoded
+    -- data changed (the latter also covers harmless formatting differences).
+    local existing = util.readFromFile(path, "rb")
+    if existing then
+        local unchanged = existing == encoded
+        if not unchanged then
+            local decoded_ok, decoded = pcall(rapidjson.decode, existing)
+            unchanged = decoded_ok and util.tableEquals(decoded, data)
+        end
+        if unchanged then
+            return path, data
+        end
+    end
+
     local ok
     ok, err = util.makePath(directory)
     if not ok and lfs.attributes(directory, "mode") ~= "directory" then error(err) end
@@ -279,17 +295,11 @@ local function findServer(server_id)
     end
 end
 
-function RemoteDocument.resolve(path, supplied_source)
-    if supplied_source and supplied_source.provider == "webdav" and supplied_source.url then
-        return supplied_source
-    end
-    local descriptor = RemoteDocument.load(path)
-    if not descriptor then return end
-    local server, settings = findServer(descriptor.server_id)
-    if not server then
-        error(_("The WebDAV server used by this remote book no longer exists."))
-    end
-
+function RemoteDocument.buildSource(descriptor, server, settings)
+    assert(type(descriptor) == "table", "remote descriptor data is required")
+    assert(type(server) == "table" and type(server.address) == "string",
+        "WebDAV server settings are required")
+    assert(settings and settings.readSetting, "cloud settings are required")
     local cache_mb = clamp(settings:readSetting("webdav_stream_cache_mb"), 8, 64, 32)
     if cache_mb ~= 8 and cache_mb ~= 16 and cache_mb ~= 32 and cache_mb ~= 64 then
         cache_mb = 32
@@ -335,6 +345,19 @@ function RemoteDocument.resolve(path, supplied_source)
         weak_validator = not (descriptor.etag and descriptor.etag:sub(1, 1) == '"'
             and descriptor.etag:sub(-1) == '"'),
     }
+end
+
+function RemoteDocument.resolve(path, supplied_source)
+    if supplied_source and supplied_source.provider == "webdav" and supplied_source.url then
+        return supplied_source
+    end
+    local descriptor = RemoteDocument.load(path)
+    if not descriptor then return end
+    local server, settings = findServer(descriptor.server_id)
+    if not server then
+        error(_("The WebDAV server used by this remote book no longer exists."))
+    end
+    return RemoteDocument.buildSource(descriptor, server, settings)
 end
 
 function RemoteDocument.userError(err)

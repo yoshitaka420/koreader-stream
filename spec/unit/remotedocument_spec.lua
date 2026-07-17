@@ -132,6 +132,52 @@ describe("remote document descriptors", function()
         assert.equals("Wed, 15 Jul 2026 00:00:00 GMT", last_modified)
     end)
 
+    it("writes new and changed descriptors but skips semantically unchanged ones", function()
+        local server_id = "11111111-2222-4333-8444-555555555555"
+        local remote_path = "/Write-elision/Book.cbz"
+        local expected_path = RemoteDocument.getDescriptorRoot() .. "/"
+            .. RemoteDocument.getIdentity(server_id, remote_path) .. "/Book.cbz"
+        os.remove(expected_path)
+
+        local descriptor = {
+            provider = "webdav",
+            server_id = server_id,
+            remote_path = remote_path,
+            display_name = "Book.cbz",
+            size = 10 * 1024 * 1024,
+            etag = '"v1"',
+            last_modified = "Wed, 15 Jul 2026 00:00:00 GMT",
+            extension = "cbz",
+        }
+        local original_write = util.writeToFile
+        local writes = 0
+        util.writeToFile = function(...)
+            writes = writes + 1
+            return original_write(...)
+        end
+
+        local ok, err = pcall(function()
+            local path = remember((RemoteDocument.create(descriptor)))
+            assert.equals(expected_path, path)
+            assert.equals(1, writes)
+
+            -- Different bytes with the same decoded descriptor must still be
+            -- treated as a no-op.
+            local encoded = assert(util.readFromFile(path, "rb"))
+            assert.is_true(original_write("\n" .. encoded .. "\n", path, true))
+            assert.equals(path, (RemoteDocument.create(descriptor)))
+            assert.equals(1, writes)
+
+            descriptor.etag = '"v2"'
+            assert.equals(path, (RemoteDocument.create(descriptor)))
+            assert.equals(2, writes)
+            assert.equals('"v2"', RemoteDocument.load(path).etag)
+        end)
+        util.writeToFile = original_write
+
+        assert.is_true(ok, err)
+    end)
+
     it("persists normalized read state across module and settings reloads", function()
         local server_id = "11111111-2222-4333-8444-555555555555"
         assert.is_true(RemoteDocument.setReadState(

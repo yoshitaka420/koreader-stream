@@ -27,6 +27,141 @@ describe("WebDAV comic selection", function()
         end
     end)
 
+    it("flushes settings before streaming only when durability is pending", function()
+        local RemoteDocument = require("document/remotedocument")
+        local UIManager = require("ui/uimanager")
+        local reader_module = "apps/reader/readerui"
+        local original_create = RemoteDocument.create
+        local original_resolve = RemoteDocument.resolve
+        local original_show = UIManager.show
+        local original_close = UIManager.close
+        local original_force_repaint = UIManager.forceRePaint
+        local original_readerui = package.loaded[reader_module]
+        local opened = 0
+        local shown_sources = {}
+        local fail_show_reader = false
+
+        RemoteDocument.create = function() return "/tmp/remote-book.cbz" end
+        RemoteDocument.resolve = function()
+            return { provider = "webdav", url = "https://dav.example.test/Book.cbz" }
+        end
+        UIManager.show = function() end
+        UIManager.close = function() end
+        UIManager.forceRePaint = function() end
+        package.loaded[reader_module] = {
+            showReader = function(_, _, _, _, _, _, source)
+                if fail_show_reader then error("simulated reader handoff failure") end
+                opened = opened + 1
+                table.insert(shown_sources, source)
+            end,
+        }
+
+        local function run(server, manager, missing_size, fail_flush)
+            local events = {}
+            local probed_source
+            local session_closed = 0
+            local session = { close = function() session_closed = session_closed + 1 end }
+            server.address = server.address or "https://dav.example.test"
+            local settings = {
+                readSetting = function() end,
+                nilOrTrue = function() return true end,
+                isTrue = function() return false end,
+                saveSetting = function(_, key, servers)
+                    assert.equals("cs_servers", key)
+                    assert.equals(server, servers[1])
+                    table.insert(events, "save")
+                end,
+                flush = function()
+                    if fail_flush then error("simulated settings flush failure") end
+                    table.insert(events, "flush")
+                end,
+            }
+            local storage = setmetatable({
+                provider = {
+                    run = function(callback) callback() end,
+                    probeRange = function(source)
+                        probed_source = source
+                        local result = {
+                            content_length = 10 * 1024 * 1024,
+                            etag = '"v1"',
+                        }
+                        if type(source) == "table" then result._session = session end
+                        return result
+                    end,
+                },
+                servers = { server },
+                server_idx = 1,
+                settings = settings,
+                _manager = manager,
+                onCloseAllMenus = function() end,
+            }, { __index = CloudStorage })
+            storage:startStreaming({
+                text = "Book.cbz",
+                suffix = "cbz",
+                url = "/Comics/Book.cbz",
+                filesize = not missing_size and 10 * 1024 * 1024 or nil,
+            })
+            if type(probed_source) == "table" then
+                if session_closed == 0 then
+                    assert.equals(probed_source, shown_sources[#shown_sources])
+                    assert.equals(session, shown_sources[#shown_sources]._probe_session)
+                end
+            else
+                assert.is_string(probed_source)
+            end
+            return events, session_closed, storage
+        end
+
+        local ok, err = pcall(function()
+            local clean_manager = {}
+            assert.same({}, (run({ type = "webdav", id = "server-id" }, clean_manager)))
+
+            local dirty_manager = { updated = true }
+            assert.same({ "flush" },
+                (run({ type = "webdav", id = "server-id" }, dirty_manager)))
+            assert.is_nil(dirty_manager.updated)
+
+            local new_server = { type = "webdav" }
+            assert.same({ "save", "flush" }, (run(new_server, {})))
+            assert.is_string(new_server.id)
+            assert.are_not.equal("", new_server.id)
+
+            -- A missing PROPFIND size uses the legacy probe and then resolves
+            -- a normal fresh source after the result supplies its size.
+            assert.same({}, (run({ type = "webdav", id = "server-id" }, {}, true)))
+            assert.equals(4, opened)
+
+            -- Once a retained native stream exists, every later failure must
+            -- close it synchronously instead of waiting for Lua GC.
+            RemoteDocument.create = function() error("simulated descriptor failure") end
+            local _, session_closed = run({ type = "webdav", id = "server-id" }, {})
+            assert.equals(1, session_closed)
+            assert.equals(4, opened)
+
+            RemoteDocument.create = original_create
+            local _, flush_session_closed, failed_storage = run(
+                { type = "webdav", id = "server-id" }, { updated = true }, nil, true)
+            assert.equals(1, flush_session_closed)
+            assert.is_true(failed_storage._stream_settings_dirty)
+            assert.equals(4, opened)
+
+            fail_show_reader = true
+            local _, handoff_session_closed = run({ type = "webdav", id = "server-id" }, {})
+            fail_show_reader = false
+            assert.equals(1, handoff_session_closed)
+            assert.equals(4, opened)
+        end)
+
+        RemoteDocument.create = original_create
+        RemoteDocument.resolve = original_resolve
+        UIManager.show = original_show
+        UIManager.close = original_close
+        UIManager.forceRePaint = original_force_repaint
+        package.loaded[reader_module] = original_readerui
+
+        assert.is_true(ok, err)
+    end)
+
     it("decorates read WebDAV rows without losing size or selection state", function()
         local RemoteDocument = require("document/remotedocument")
         local original_get_read_states = RemoteDocument.getReadStates

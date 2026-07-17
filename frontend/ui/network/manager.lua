@@ -22,6 +22,13 @@ require("ffi/posix_h")
 -- We unfortunately don't have that one in ffi/posix_h :/
 local EBUSY = 16
 
+-- Poll quickly once, then back off while the platform reconnects. Association
+-- and DHCP take seconds on e-readers; querying every 250 ms for the full wait
+-- only wakes the CPU and duplicates the platform restore worker's polling.
+local connectivity_check_initial_delay_seconds = 0.25
+local connectivity_check_max_delay_seconds = 2
+local connectivity_check_timeout_seconds = 45
+
 local NetworkMgr = {
     is_wifi_on = false,
     is_connected = false,
@@ -104,10 +111,10 @@ end
 
 -- Used after restoreWifiAsync() and the turn_on beforeWifiAction to make sure we eventually send a NetworkConnected event,
 -- as quite a few things rely on it (KOSync, c.f. #5109; the network activity check, c.f., #6424).
-function NetworkMgr:connectivityCheck(iter, callback, widget)
+function NetworkMgr:connectivityCheck(elapsed, callback, widget, previous_delay)
     -- Give up after a while (restoreWifiAsync can take over 45s, so, try to cover that)...
-    if iter >= 180 then
-        logger.info("Failed to restore Wi-Fi (after", iter * 0.25, "seconds)!")
+    if elapsed >= connectivity_check_timeout_seconds then
+        logger.info("Failed to restore Wi-Fi (after", elapsed, "seconds)!")
         self:_abortWifiConnection()
 
         -- Handle the UI warning if it's from a beforeWifiAction...
@@ -122,7 +129,7 @@ function NetworkMgr:connectivityCheck(iter, callback, widget)
     if self.is_wifi_on and self.is_connected then
         self.wifi_was_on = true
         G_reader_settings:makeTrue("wifi_was_on")
-        logger.info("Wi-Fi successfully restored (after", iter * 0.25, "seconds)!")
+        logger.info("Wi-Fi successfully restored (after", elapsed, "seconds)!")
         -- Update lease_ssid from wpa_supplicant's current association.
         -- restoreWifiAsync() re-DHCPs in shell but never touches Lua state, so we sync
         -- here to avoid falsely flagging a valid post-restore lease as stale (#14790).
@@ -153,13 +160,22 @@ function NetworkMgr:connectivityCheck(iter, callback, widget)
         -- We're done, so we can stop blocking concurrent connection attempts
         self.pending_connection = false
     else
-        UIManager:scheduleIn(0.25, self.connectivityCheck, self, iter + 1, callback, widget)
+        local next_delay = math.min(
+            (previous_delay or connectivity_check_initial_delay_seconds) * 2,
+            connectivity_check_max_delay_seconds)
+        -- Land exactly on the deadline instead of overshooting it by a full
+        -- backoff interval, preserving the historical 45-second timeout.
+        next_delay = math.min(next_delay, connectivity_check_timeout_seconds - elapsed)
+        UIManager:scheduleIn(next_delay, self.connectivityCheck, self,
+            elapsed + next_delay, callback, widget, next_delay)
     end
 end
 
 function NetworkMgr:scheduleConnectivityCheck(callback, widget)
     self.pending_connectivity_check = true
-    UIManager:scheduleIn(0.25, self.connectivityCheck, self, 1, callback, widget)
+    UIManager:scheduleIn(connectivity_check_initial_delay_seconds,
+        self.connectivityCheck, self, connectivity_check_initial_delay_seconds,
+        callback, widget, connectivity_check_initial_delay_seconds)
 end
 
 function NetworkMgr:unscheduleConnectivityCheck()

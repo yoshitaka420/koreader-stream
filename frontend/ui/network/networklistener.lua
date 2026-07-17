@@ -14,6 +14,7 @@ local NetworkListener = EventListener:extend{
     _activity_check_scheduled = nil,
     _last_tx_packets = nil,
     _activity_check_delay_seconds = nil,
+    _released_lease_recheck = nil,
 }
 
 if not Device:hasWifiToggle() then
@@ -85,6 +86,10 @@ end
 -- Everything below is to handle auto_disable_wifi ;).
 local default_network_timeout_seconds = 5*60
 local max_network_timeout_seconds = 30*60
+-- A workflow which held a lease has just finished doing network I/O, so it is
+-- useful to revisit an otherwise idle radio sooner than the normal activity
+-- cadence. This is a one-shot delay: subsequent checks use the normal backoff.
+local released_lease_timeout_seconds = 60
 -- If autostandby is enabled, shorten the timeouts
 local auto_standby = G_reader_settings:readSetting("auto_standby_timeout_seconds", -1)
 if auto_standby > 0 then
@@ -127,6 +132,9 @@ function NetworkListener:_unscheduleActivityCheck()
     if NetworkListener._activity_check_delay_seconds then
         NetworkListener._activity_check_delay_seconds = nil
     end
+    if NetworkListener._released_lease_recheck then
+        NetworkListener._released_lease_recheck = nil
+    end
 end
 
 -- NOTE: This must *never* access instance-specific members!
@@ -166,8 +174,14 @@ function NetworkListener:_scheduleActivityCheck()
     -- Update tracker for next iter
     NetworkListener._last_tx_packets = tx_packets
 
+    -- The short post-lease check is a one-shot. If traffic kept the radio up,
+    -- return to the ordinary five-minute cadence rather than extending the
+    -- special one-minute delay by another full interval.
+    if NetworkListener._released_lease_recheck then
+        NetworkListener._released_lease_recheck = nil
+        NetworkListener._activity_check_delay_seconds = default_network_timeout_seconds
     -- If it's already been scheduled, increase the delay until we hit the ceiling
-    if NetworkListener._activity_check_delay_seconds then
+    elseif NetworkListener._activity_check_delay_seconds then
         NetworkListener._activity_check_delay_seconds = NetworkListener._activity_check_delay_seconds + default_network_timeout_seconds
 
         if NetworkListener._activity_check_delay_seconds > max_network_timeout_seconds then
@@ -210,7 +224,7 @@ end
 
 -- A long-lived workflow may have allowed the activity-check backoff to reach
 -- its ceiling. Once its final lease is released, restart from a fresh traffic
--- baseline so idle Wi-Fi is reconsidered after the normal timeout instead of
+-- baseline and reconsider idle Wi-Fi after a short one-shot delay instead of
 -- potentially staying up for another half hour.
 function NetworkListener:onNetworkLeaseReleased()
     logger.dbg("NetworkListener: onNetworkLeaseReleased")
@@ -220,7 +234,13 @@ function NetworkListener:onNetworkLeaseReleased()
         return
     end
     NetworkListener:_unscheduleActivityCheck()
-    NetworkListener:_scheduleActivityCheck()
+    NetworkListener._last_tx_packets = NetworkListener:_getTxPackets()
+    NetworkListener._activity_check_delay_seconds = released_lease_timeout_seconds
+    NetworkListener._released_lease_recheck = true
+    UIManager:scheduleIn(released_lease_timeout_seconds, NetworkListener._scheduleActivityCheck)
+    NetworkListener._activity_check_scheduled = true
+    logger.dbg("NetworkListener: post-lease network activity check scheduled in",
+        released_lease_timeout_seconds, "seconds")
 end
 
 -- Also unschedule on suspend (and we happen to also kill Wi-Fi to do so, so resetting the stats is also relevant here)

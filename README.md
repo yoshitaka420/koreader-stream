@@ -15,6 +15,7 @@ best-effort mode because solid RAR archives are not inherently random-access.
 
 - Synchronous, seekable WebDAV streaming for CBZ and CBR documents.
 - A bounded in-memory block cache with configurable 8–64 MiB limits.
+- A retained range-probe stream that avoids a second connection setup per book.
 - Strong response validation for byte ranges, file size, validators, redirects,
   TLS, and truncated responses.
 - Opt-in page lookahead and strict CBR transfer limits.
@@ -130,11 +131,11 @@ uncached page never fails merely because Wi-Fi went to sleep; closing the book
 allows the normal inactivity timer to turn Wi-Fi off.
 
 The focused Kobo package includes KOReader's **Auto power save** and
-**Automatic dimmer** plugins. Autosuspend retains KOReader's 15-minute default
-as a safety net even when a sleep-cover event is missed. The dimmer remains
-opt-in under **Settings → Screen → Automatic dimmer**. Suspend remains the
-largest safe idle-power saving; autostandby is deliberately not enabled by
-this fork because its hardware reliability varies between Kobo generations.
+**Automatic dimmer** plugins. It autosuspends after five idle minutes and dims
+the frontlight after two idle minutes by default; both remain configurable.
+Suspend remains the largest safe idle-power saving; autostandby is deliberately
+not enabled by this fork because its hardware reliability varies between Kobo
+generations.
 
 ## Upstream and license
 

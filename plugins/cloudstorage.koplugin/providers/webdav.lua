@@ -345,13 +345,21 @@ end
 
 function WebDav.probeRange(url, expected_size)
     local base = WebDav.base
-    local path = WebDavApi.getJoinedPath(base.address, url)
-    local ok, result = pcall(require("ffi/mupdf").probeRemote, {
-        url = path,
-        username = base.username,
-        password = base.password,
-        expected_size = expected_size or 0,
-    })
+    local options
+    local retain_stream = type(url) == "table"
+    if retain_stream then
+        options = url
+    else
+        options = {
+            url = WebDavApi.getJoinedPath(base.address, url),
+            username = base.username,
+            password = base.password,
+            expected_size = expected_size or 0,
+        }
+    end
+    local mupdf = require("ffi/mupdf")
+    local probe = retain_stream and mupdf.probeRemoteStream or mupdf.probeRemote
+    local ok, result = pcall(probe, options)
     if not ok then
         return nil, RemoteDocument.userError(result)
     end

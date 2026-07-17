@@ -193,4 +193,26 @@ describe("Readerui module", function()
         assert.is_true(ok, err)
         assert.same({ "flush", "forget" }, events)
     end)
+    it("should close a retained WebDAV probe when document opening throws", function()
+        local old_open_document = DocumentRegistry.openDocument
+        local old_instance = ReaderUI.instance
+        local close_count = 0
+        local source = {
+            _probe_session = {
+                close = function() close_count = close_count + 1 end,
+            },
+        }
+        ReaderUI.instance = nil
+        DocumentRegistry.openDocument = function() error("simulated remote open failure") end
+
+        local ok, err = pcall(ReaderUI.doShowReader, ReaderUI,
+            "/tmp/remote-open-failure.cbz", nil, nil, source)
+
+        DocumentRegistry.openDocument = old_open_document
+        ReaderUI.instance = old_instance
+        assert.is_false(ok)
+        assert.matches("simulated remote open failure", err)
+        assert.equals(1, close_count)
+        assert.is_nil(source._probe_session)
+    end)
 end)

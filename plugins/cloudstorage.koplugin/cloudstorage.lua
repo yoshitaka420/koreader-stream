@@ -345,25 +345,86 @@ end
 
 function CloudStorage:startStreaming(item)
     self.provider.run(function()
+        local server = self.servers[self.server_idx]
+        local RemoteDocument = require("document/remotedocument")
+        local original_server_id = server.id
+        local server_id_added = RemoteDocument.ensureServerId(server)
+        local suffix = (item.suffix or util.getFileNameSuffix(item.text) or ""):lower()
+        local item_size = tonumber(item.filesize)
+        local probe_target = item.url
+        local reusable_source
+        if item_size and item_size > 0 and item_size < 2^53
+                and item_size == math.floor(item_size) then
+            -- Build the final stream options before probing so the successful
+            -- native probe (and its live libcurl connection) can be transferred
+            -- directly into ReaderUI without opening a second connection.
+            local ok_source, provisional_source = pcall(RemoteDocument.buildSource, {
+                provider = "webdav",
+                server_id = server.id,
+                remote_path = RemoteDocument.normalizePath(item.url),
+                display_name = item.text,
+                size = item_size,
+                extension = suffix,
+            }, server, self.settings)
+            if not ok_source then
+                if server_id_added then server.id = original_server_id end
+                UIManager:show(InfoMessage:new{ text = RemoteDocument.userError(provisional_source) })
+                return
+            end
+            probe_target = provisional_source
+            reusable_source = provisional_source
+        end
+
         local probing = InfoMessage:new{ text = _("Checking byte-range streaming support…"), timeout = 0 }
         UIManager:show(probing)
         UIManager:forceRePaint()
-        local probe, err = self.provider.probeRange(item.url, item.filesize)
+        local probe, err = self.provider.probeRange(probe_target, item.filesize)
         UIManager:close(probing)
         if not probe then
+            if server_id_added then server.id = original_server_id end
             UIManager:show(InfoMessage:new{ text = err })
             return
         end
-
-        local server = self.servers[self.server_idx]
-        local RemoteDocument = require("document/remotedocument")
-        if RemoteDocument.ensureServerId(server) then
-            self.settings:saveSetting("cs_servers", self.servers)
+        local function closeProbeSession()
+            local session = probe and probe._session
+            if session and session.close then session:close() end
+            if probe then probe._session = nil end
         end
-        -- The descriptor is reopened outside the cloud-storage plugin, so its
-        -- server UUID must be durable before ReaderUI is started.
-        self.settings:flush()
-        local suffix = (item.suffix or util.getFileNameSuffix(item.text) or ""):lower()
+
+        -- Persist a new server UUID and pending server edits only after the
+        -- network probe succeeds. Failed opens therefore cause no flash write.
+        local settings_changed = server_id_added or self._stream_settings_dirty
+            or (self._manager and self._manager.updated)
+        if settings_changed then
+            local settings_ok, settings_err = pcall(function()
+                if server_id_added or self._stream_settings_dirty then
+                    self.settings:saveSetting("cs_servers", self.servers)
+                end
+                self.settings:flush()
+                -- LuaSettings:flush historically does not propagate a failed
+                -- util.writeToFile call. Before creating a descriptor that
+                -- depends on this server UUID, verify the durable file when a
+                -- real settings path is available.
+                if self.settings.file then
+                    local read_ok, persisted = pcall(dofile, self.settings.file)
+                    if not read_ok or type(persisted) ~= "table"
+                            or not util.tableEquals(persisted.cs_servers, self.servers) then
+                        error("cloud settings could not be verified after saving")
+                    end
+                end
+            end)
+            if not settings_ok then
+                -- Keep the in-memory ID and mark it pending so a later attempt
+                -- retries persistence instead of creating a different UUID.
+                self._stream_settings_dirty = true
+                closeProbeSession()
+                UIManager:show(InfoMessage:new{ text = RemoteDocument.userError(settings_err) })
+                return
+            end
+            self._stream_settings_dirty = nil
+            if self._manager then self._manager.updated = nil end
+        end
+
         -- Validators returned by PROPFIND may describe the WebDAV resource,
         -- while the ranged GET is served by a redirecting CDN with different
         -- validator semantics. Only persist validators observed through the
@@ -382,16 +443,37 @@ function CloudStorage:startStreaming(item)
                 extension = suffix,
             })
             if not ok then
+                closeProbeSession()
                 UIManager:show(InfoMessage:new{ text = RemoteDocument.userError(descriptor_path) })
                 return
             end
-            local ok_source, source = pcall(RemoteDocument.resolve, descriptor_path)
-            if not ok_source or not source then
-                UIManager:show(InfoMessage:new{ text = RemoteDocument.userError(source) })
-                return
+            local source = reusable_source
+            if source then
+                source.expected_size = probe.content_length
+                source.etag = validator_etag
+                source.last_modified = validator_last_modified
+                source.weak_validator = not RemoteDocument.isStrongETag(validator_etag)
+            else
+                local ok_source
+                ok_source, source = pcall(RemoteDocument.resolve, descriptor_path)
+                if not ok_source or not source then
+                    closeProbeSession()
+                    UIManager:show(InfoMessage:new{ text = RemoteDocument.userError(source) })
+                    return
+                end
             end
-            self:onCloseAllMenus()
-            require("apps/reader/readerui"):showReader(descriptor_path, nil, nil, nil, nil, source)
+            source._probe_session = probe._session
+            probe._session = nil
+            local open_ok, open_err = pcall(function()
+                self:onCloseAllMenus()
+                require("apps/reader/readerui"):showReader(descriptor_path, nil, nil, nil, nil, source)
+            end)
+            if not open_ok then
+                local session = source._probe_session
+                if session and session.close then session:close() end
+                source._probe_session = nil
+                UIManager:show(InfoMessage:new{ text = RemoteDocument.userError(open_err) })
+            end
         end
         openRemoteBook()
     end)
